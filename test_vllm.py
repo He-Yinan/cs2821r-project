@@ -1,9 +1,9 @@
 import os, sys
-sys.path.append(os.path.join(os.path.dirname(__file__), "HippoRAG", "src"))
+sys.path.append(os.path.join(os.path.dirname(__file__), "hipporag", "src"))
 from hipporag import HippoRAG
 
 
-save_dir = "outputs"  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
+save_dir = "outputs"  # Define save directory for hipporag objects (each LLM/Embedding model combination will create a new subdirectory)
 llm_model_name = "Qwen/Qwen3-8B"  # Any OpenAI model name
 embedding_model_name = "facebook/contriever"  # Embedding model name (NV-Embed, GritLM or Contriever for now)
 llm_base_url= "http://holygpu7c26105.rc.fas.harvard.edu:8000/v1"  # Base url for your deployed LLM (i.e. http://localhost:8000/v1)
