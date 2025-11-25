@@ -7,9 +7,9 @@
 Create submodule HippoRAG (don't need to run this)
 
 ```sh
-# First fork HippoRAG on its GitHub repo page
+# First fork hipporag on its GitHub repo page
 
-git submodule add https://github.com/<USERNAME>/HippoRAG HippoRAG
+git submodule add https://github.com/<USERNAME>/hipporag hipporag
 git commit -m "Add HippoRAG submodule"
 git submodule update --init --recursive  # Get all submodules ready
 ```
@@ -18,7 +18,7 @@ Python environment (run this)
 
 ```sh
 mamba create -n hipporag python=3.10
-pip install -r HippoRAG/requirements.txt
+pip install -r hipporag/requirements.txt
 ```
 
 ### Test
