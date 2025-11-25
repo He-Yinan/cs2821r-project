@@ -1,13 +1,12 @@
 import os, sys
 sys.path.append(os.path.join(os.path.dirname(__file__), "HippoRAG", "src"))
 from hipporag import HippoRAG
-from hipporag.utils.config_utils import BaseConfig
 
 
 save_dir = "outputs"  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
 llm_model_name = "Qwen/Qwen3-8B"  # Any OpenAI model name
-embedding_model_name = "nvidia/NV-Embed-v2"  # Embedding model name (NV-Embed, GritLM or Contriever for now)
-llm_base_url= "http://holygpu7c26105:8000/v1"  # Base url for your deployed LLM (i.e. http://localhost:8000/v1)
+embedding_model_name = "facebook/contriever"  # Embedding model name (NV-Embed, GritLM or Contriever for now)
+llm_base_url= "http://holygpu7c26105.rc.fas.harvard.edu:8000/v1"  # Base url for your deployed LLM (i.e. http://localhost:8000/v1)
 docs = [
     "Oliver Badman is a politician.",
     "George Rankin is a politician.",
@@ -60,3 +59,5 @@ gold_docs = [
 rag_results = hipporag.rag_qa(queries=queries, 
                               gold_docs=gold_docs,
                               gold_answers=answers)
+
+print(rag_results)
