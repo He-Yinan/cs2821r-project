@@ -61,16 +61,26 @@ class PromptTemplateManager:
                 script_name = os.path.splitext(filename)[0]
 
                 try:
-                    try:
-                        module_name = f"src.hipporag.prompts.templates.{script_name}"
-                        module = importlib.import_module(module_name)
-                    except ModuleNotFoundError:
-                        module_name = f".prompts.templates.{script_name}"
-                        module = importlib.import_module(module_name, 'hipporag')
-
-                    # spec = importlib.util.spec_from_file_location(script_name, script_path)
-                    # module = importlib.util.module_from_spec(spec)
-                    # spec.loader.exec_module(module)
+                    # Use file-based import for more robust loading
+                    script_path = os.path.join(self.templates_dir, filename)
+                    spec = importlib.util.spec_from_file_location(
+                        f"hipporag.prompts.templates.{script_name}", 
+                        script_path
+                    )
+                    module = importlib.util.module_from_spec(spec)
+                    # Set __package__ and __name__ to allow relative imports within templates
+                    module.__package__ = "hipporag.prompts.templates"
+                    module.__name__ = f"hipporag.prompts.templates.{script_name}"
+                    # Ensure parent packages are in sys.modules for relative imports
+                    import sys
+                    if "hipporag" not in sys.modules:
+                        import hipporag
+                    if "hipporag.prompts" not in sys.modules:
+                        import hipporag.prompts
+                    if "hipporag.prompts.templates" not in sys.modules:
+                        import hipporag.prompts.templates
+                    spec.loader.exec_module(module)
+                    module_name = f"hipporag.prompts.templates.{script_name}"
 
                     if not hasattr(module, "prompt_template"):
                         logger.error(f"Module '{module_name}' does not define a 'prompt_template'.")

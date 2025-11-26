@@ -143,9 +143,8 @@ class OpenIE:
         }
         """
 
-        # PREPROCESSING：注意这里使用的是新的 typed 模板
         messages = self.prompt_template_manager.render(
-            name='triple_extraction_typed',
+            name='triple_extraction',
             passage=passage,
             named_entity_json=json.dumps({"named_entities": named_entities})
         )

@@ -1,5 +1,6 @@
 import os, sys
-sys.path.append(os.path.join(os.path.dirname(__file__), "hipporag", "src"))
+# Add rag/src to path so we can import hipporag
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "rag", "src"))
 from hipporag import HippoRAG
 
 

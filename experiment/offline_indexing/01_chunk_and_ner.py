@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""
+Step 1 of the modular offline indexing pipeline:
+  - Load a (sub)set of corpus documents.
+  - Generate deterministic chunk IDs for each passage.
+  - Run NER with the OpenIE module (using the vLLM-served OpenAI-compatible endpoint).
+  - Persist chunk metadata and NER outputs to the shared scratch directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
+from pathlib import Path
+from typing import Iterable, Sequence
+
+from tqdm import tqdm
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "rag" / "src"))
+
+from hipporag.utils.config_utils import BaseConfig
+from hipporag.utils.misc_utils import compute_mdhash_id, NerRawOutput
+from hipporag.llm.openai_gpt import CacheOpenAI
+from hipporag.information_extraction.openie_openai import OpenIE
+
+from experiment.common.io_utils import (
+    SCRATCH_ROOT,
+    build_experiment_dir,
+    load_json,
+    write_json,
+    write_jsonl,
+)
+
+
+def format_passage(doc: dict) -> str:
+    title = str(doc.get("title", "") or "").strip()
+    text = str(doc.get("text", "") or doc.get("paragraph_text", "") or "").strip()
+    if title and text:
+        return f"{title}\n{text}"
+    return title or text
+
+
+def chunk_corpus(corpus: list[dict]) -> list[dict]:
+    chunks = []
+    for idx, doc in enumerate(corpus):
+        content = format_passage(doc)
+        if not content:
+            continue
+        chunk_id = compute_mdhash_id(content, prefix="chunk-")
+        chunks.append(
+            {
+                "chunk_id": chunk_id,
+                "content": content,
+                "source_index": idx,
+                "title": doc.get("title"),
+            }
+        )
+    return chunks
+
+
+def ner_worker(openie: OpenIE, chunk: dict) -> dict:
+    ner_output: NerRawOutput = openie.ner(chunk_key=chunk["chunk_id"], passage=chunk["content"])
+    return {
+        "chunk_id": ner_output.chunk_id,
+        "entities": ner_output.unique_entities,
+        "raw_response": ner_output.response,
+        "metadata": ner_output.metadata,
+    }
+
+
+def run_ner(openie: OpenIE, chunks: list[dict], max_workers: int) -> Iterable[dict]:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(ner_worker, openie, chunk): chunk for chunk in chunks}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="NER"):
+            yield future.result()
+
+
+def init_openie(llm_name: str, llm_base_url: str, cache_root: Path) -> OpenIE:
+    config = BaseConfig(
+        save_dir=str(cache_root),
+        llm_name=llm_name,
+        llm_base_url=llm_base_url,
+        openie_mode="online",
+    )
+    llm = CacheOpenAI.from_experiment_config(config)
+    return OpenIE(llm_model=llm)
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Chunk corpus and run NER (step 1).")
+    parser.add_argument("--experiment-name", required=True, help="Name for the scratch experiment folder")
+    parser.add_argument("--corpus-file", required=True, type=Path, help="Path to <dataset>_corpus.json subset")
+    parser.add_argument("--llm-base-url", required=True, help="OpenAI-compatible endpoint for the vLLM server")
+    parser.add_argument("--llm-model-name", default="Qwen/Qwen3-8B-Instruct", help="LLM model identifier")
+    parser.add_argument("--max-workers", type=int, default=4, help="Threads for concurrent NER calls")
+    parser.add_argument(
+        "--output-subdir",
+        default="offline_indexing/01_chunk_ner",
+        help="Relative subdirectory (under experiment) for outputs",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    experiment_root = build_experiment_dir(args.experiment_name)
+    output_dir = build_experiment_dir(args.experiment_name, args.output_subdir)
+    cache_dir = build_experiment_dir(args.experiment_name, "llm_cache")
+
+    corpus = load_json(args.corpus_file)
+    chunks = chunk_corpus(corpus)
+
+    chunks_path = output_dir / "chunks.jsonl"
+    ner_path = output_dir / "ner.jsonl"
+    manifest_path = output_dir / "manifest.json"
+
+    write_jsonl(chunks_path, chunks)
+
+    openie = init_openie(args.llm_model_name, args.llm_base_url, cache_dir)
+    ner_records = list(run_ner(openie, chunks, max_workers=args.max_workers))
+    write_jsonl(ner_path, ner_records)
+
+    manifest = {
+        "corpus_file": str(args.corpus_file),
+        "chunks_path": str(chunks_path),
+        "ner_path": str(ner_path),
+        "num_chunks": len(chunks),
+        "scratch_root": str(SCRATCH_ROOT),
+    }
+    write_json(manifest_path, manifest)
+    print(f"Chunks saved to {chunks_path}")
+    print(f"NER outputs saved to {ner_path}")
+    print(f"Manifest saved to {manifest_path}")
+
+
+if __name__ == "__main__":
+    main()
+
