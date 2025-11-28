@@ -18,7 +18,8 @@ export HF_HOME="${CACHE_ROOT}/hf_home"
 export HUGGINGFACE_HUB_CACHE="${CACHE_ROOT}/hf_cache"
 
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-musique_demo}
-LLM_BASE_URL=${LLM_BASE_URL:-http://holygpu7c26106.rc.fas.harvard.edu:8000/v1}
+# LLM_BASE_URL=${LLM_BASE_URL:-http://holygpu7c26106.rc.fas.harvard.edu:8000/v1}
+LLM_BASE_URL=${LLM_BASE_URL:-http://holygpu7c26106.rc.fas.harvard.edu:8001/v1}
 LLM_MODEL_NAME=${LLM_MODEL_NAME:-Qwen/Qwen3-8B}
 MAX_WORKERS=${MAX_WORKERS:-8}
 MAX_CHUNKS=${MAX_CHUNKS:-}  # Set to a number (e.g., 5) for testing, leave empty for full run

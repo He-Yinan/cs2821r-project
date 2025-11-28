@@ -1,39 +1,42 @@
 from .ner import one_shot_ner_paragraph, one_shot_ner_output
 from ...utils.llm_utils import convert_format_to_template
 
-ner_conditioned_re_system ="""You are a knowledge extraction system. Extract factual relations from passages and output ONLY valid JSON.
+ner_conditioned_re_system ="""You are a JSON-only output system. Extract triples from passages and output ONLY valid JSON.
 
-CRITICAL: Output ONLY the JSON object. Do NOT include reasoning, explanations, or any other text.
+STRICT REQUIREMENTS:
+1. Output ONLY the JSON object. Nothing else.
+2. DO NOT include any reasoning, explanations, thinking, or commentary.
+3. DO NOT use <think>, <reasoning>, or any other tags.
+4. DO NOT write any text before or after the JSON.
+5. Start your response with {{ and end with }}.
+6. Your entire response must be parseable as valid JSON.
 
-Output format (JSON only):
-{
+REQUIRED OUTPUT FORMAT (copy this structure exactly):
+{{
   "triples": [
-    ["subject", "predicate", "object", "relation_type", confidence],
-    ...
+    ["subject", "predicate", "object", "relation_type", confidence]
   ]
-}
+}}
 
-Relation Types (choose ONE per triple):
-- HIERARCHICAL: is_a, part_of, subclass_of, capital_of, membership, spouse, child, parent
-- TEMPORAL: founded_in, started_on, occurred_in, birth_date, first_appearance, last_appearance
+Relation Types (MUST use one of these 5 types):
+- HIERARCHICAL: is_a, part_of, subclass_of, membership, spouse, child, parent
+- TEMPORAL: started_on, occurred_in, published_in, birth_date, first_appearance, last_appearance
 - SPATIAL: located_in, adjacent_to, inside, contains, geographic relations
-- CAUSALITY: causes, results_in, leads_to, enables, created_by
-- ATTRIBUTION: painted_by, owned_by, has_property, offers, plays, portrayed_by, occupation
+- CAUSALITY: causes, results_in, leads_to, enables, created_by, written_by
+- ATTRIBUTION: owned_by, has_property, offers, plays, portrayed_by, occupation
 
 Confidence (float 0.0-1.0):
 - 0.9-1.0: explicit in passage
 - 0.7-0.9: likely correct, minor ambiguity
 - 0.5-0.7: uncertain evidence
-- <0.5: DO NOT output
 
 Rules:
 - Each triple must include at least one named entity from the provided list
-- Resolve pronouns to specific entities
 - Use ONLY the 5 relation types listed above
-- Output ONLY valid JSON, no other text
+- Output ONLY the JSON object - no other text whatsoever
 """
 
-ner_conditioned_re_frame = """Extract triples from this passage. Use the named entities provided.
+ner_conditioned_re_frame = """Extract triples from this passage using the named entities.
 
 Passage:
 {passage}
@@ -41,14 +44,20 @@ Passage:
 Named entities:
 {named_entity_json}
 
-Output ONLY a JSON object with this exact structure:
-{
+REQUIRED OUTPUT (JSON only, no other text):
+{{
   "triples": [
     ["subject", "predicate", "object", "relation_type", confidence]
   ]
-}
+}}
 
-Do NOT include reasoning. Output ONLY the JSON object."""
+CRITICAL: Output ONLY the JSON object above. Do NOT include:
+- Any reasoning or thinking
+- Any explanations
+- Any tags like <think> or <reasoning>
+- Any text before or after the JSON
+
+Start with {{ and end with }}."""
 
 
 ner_conditioned_re_input = ner_conditioned_re_frame.format(passage=one_shot_ner_paragraph, named_entity_json=one_shot_ner_output)

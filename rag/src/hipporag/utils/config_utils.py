@@ -181,6 +181,14 @@ class BaseConfig:
         default=0.5,
         metadata={"help": "Damping factor for ppr algorithm."}
     )
+    use_relation_aware_retrieval: bool = field(
+        default=False,
+        metadata={"help": "Enable relation-aware multi-agent retrieval"}
+    )
+    manager_agent_temperature: float = field(
+        default=0.3,
+        metadata={"help": "Temperature for manager agent LLM calls"}
+    )
     
     
     # QA specific attributes

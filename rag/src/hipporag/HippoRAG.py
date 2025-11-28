@@ -28,6 +28,8 @@ from .evaluation.qa_eval import QAExactMatch, QAF1Score
 from .prompts.linking import get_query_instruction
 from .prompts.prompt_template_manager import PromptTemplateManager
 from .rerank import DSPyFilter
+from .agents.manager_agent import ManagerAgent
+from .retrieval.relation_aware_ppr import run_relation_aware_ppr
 from .utils.misc_utils import *
 from .utils.misc_utils import NerRawOutput, TripleRawOutput
 from .utils.embed_utils import retrieve_knn
@@ -154,6 +156,16 @@ class HippoRAG:
         self.openie_results_path = os.path.join(self.global_config.save_dir,f'openie_results_ner_{self.global_config.llm_name.replace("/", "_")}.json')
 
         self.rerank_filter = DSPyFilter(self)
+
+        # Initialize Manager Agent for relation-aware retrieval
+        if self.global_config.use_relation_aware_retrieval:
+            self.manager_agent = ManagerAgent(
+                llm=self.llm_model,
+                prompt_template_manager=self.prompt_template_manager
+            )
+            logger.info("Manager Agent initialized for relation-aware retrieval")
+        else:
+            self.manager_agent = None
 
         self.ready_to_retrieve = False
 
@@ -418,12 +430,25 @@ class HippoRAG:
                 logger.info('No facts found after reranking, return DPR results')
                 sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
             else:
-                sorted_doc_ids, sorted_doc_scores = self.graph_search_with_fact_entities(query=query,
-                                                                                         link_top_k=self.global_config.linking_top_k,
-                                                                                         query_fact_scores=query_fact_scores,
-                                                                                         top_k_facts=top_k_facts,
-                                                                                         top_k_fact_indices=top_k_fact_indices,
-                                                                                         passage_node_weight=self.global_config.passage_node_weight)
+                # Use relation-aware retrieval if enabled, otherwise use standard retrieval
+                if self.global_config.use_relation_aware_retrieval and self.manager_agent is not None:
+                    sorted_doc_ids, sorted_doc_scores = self.graph_search_with_relation_aware_ppr(
+                        query=query,
+                        link_top_k=self.global_config.linking_top_k,
+                        query_fact_scores=query_fact_scores,
+                        top_k_facts=top_k_facts,
+                        top_k_fact_indices=top_k_fact_indices,
+                        passage_node_weight=self.global_config.passage_node_weight
+                    )
+                else:
+                    sorted_doc_ids, sorted_doc_scores = self.graph_search_with_fact_entities(
+                        query=query,
+                        link_top_k=self.global_config.linking_top_k,
+                        query_fact_scores=query_fact_scores,
+                        top_k_facts=top_k_facts,
+                        top_k_fact_indices=top_k_fact_indices,
+                        passage_node_weight=self.global_config.passage_node_weight
+                    )
 
             top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]]
 
@@ -1732,6 +1757,149 @@ class HippoRAG:
 
         return ppr_sorted_doc_ids, ppr_sorted_doc_scores
 
+    def graph_search_with_relation_aware_ppr(self, query: str,
+                                            link_top_k: int,
+                                            query_fact_scores: np.ndarray,
+                                            top_k_facts: List[Tuple],
+                                            top_k_fact_indices: List[str],
+                                            passage_node_weight: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Relation-aware version of graph_search_with_fact_entities.
+        
+        This method uses the Manager Agent to generate relation influence factors (β values)
+        and applies them to edge weights in the Personalized PageRank algorithm.
+        
+        Parameters:
+            query (str): The input query string for which similarity and relevance computations
+                need to be performed.
+            link_top_k (int): The number of top phrases to include from the linking score map for
+                downstream processing.
+            query_fact_scores (np.ndarray): An array of scores representing fact-query similarity
+                for each of the provided facts.
+            top_k_facts (List[Tuple]): A list of top-ranked facts, where each fact is represented
+                as a tuple of its subject, predicate, and object.
+            top_k_fact_indices (List[str]): Corresponding indices or identifiers for the top-ranked
+                facts in the query_fact_scores array.
+            passage_node_weight (float): Default weight to scale passage scores in the graph.
+        
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: A tuple containing two arrays:
+                - The first array corresponds to document IDs sorted based on their scores.
+                - The second array consists of the PPR scores associated with the sorted document IDs.
+        """
+        # Get relation influence factors from manager agent
+        if self.manager_agent is None:
+            logger.warning("Manager agent not initialized, falling back to standard retrieval")
+            return self.graph_search_with_fact_entities(
+                query=query,
+                link_top_k=link_top_k,
+                query_fact_scores=query_fact_scores,
+                top_k_facts=top_k_facts,
+                top_k_fact_indices=top_k_fact_indices,
+                passage_node_weight=passage_node_weight
+            )
+        
+        logger.debug(f"Using relation-aware retrieval for query: {query[:50]}...")
+        relation_influence_factors = self.manager_agent.get_relation_influence_factors(query)
+        
+        # Assigning phrase weights based on selected facts (same as original)
+        linking_score_map = {}
+        phrase_scores = {}
+        phrase_weights = np.zeros(len(self.graph.vs['name']))
+        passage_weights = np.zeros(len(self.graph.vs['name']))
+        number_of_occurs = np.zeros(len(self.graph.vs['name']))
+        
+        phrases_and_ids = set()
+        
+        for rank, f in enumerate(top_k_facts):
+            subject_phrase = f[0].lower()
+            predicate_phrase = f[1].lower()
+            object_phrase = f[2].lower()
+            fact_score = query_fact_scores[
+                top_k_fact_indices[rank]] if query_fact_scores.ndim > 0 else query_fact_scores
+            
+            for phrase in [subject_phrase, object_phrase]:
+                phrase_key = compute_mdhash_id(
+                    content=phrase,
+                    prefix="entity-"
+                )
+                phrase_id = self.node_name_to_vertex_idx.get(phrase_key, None)
+                
+                if phrase_id is not None:
+                    weighted_fact_score = fact_score
+                    
+                    if len(self.ent_node_to_chunk_ids.get(phrase_key, set())) > 0:
+                        weighted_fact_score /= len(self.ent_node_to_chunk_ids[phrase_key])
+                    
+                    phrase_weights[phrase_id] += weighted_fact_score
+                    number_of_occurs[phrase_id] += 1
+                
+                phrases_and_ids.add((phrase, phrase_id))
+        
+        phrase_weights /= number_of_occurs
+        
+        for phrase, phrase_id in phrases_and_ids:
+            if phrase not in phrase_scores:
+                phrase_scores[phrase] = []
+            phrase_scores[phrase].append(phrase_weights[phrase_id])
+        
+        # Calculate average fact score for each phrase
+        for phrase, scores in phrase_scores.items():
+            linking_score_map[phrase] = float(np.mean(scores))
+        
+        if link_top_k:
+            phrase_weights, linking_score_map = self.get_top_k_weights(
+                link_top_k,
+                phrase_weights,
+                linking_score_map
+            )
+        
+        # Get passage scores according to chosen dense retrieval model
+        dpr_sorted_doc_ids, dpr_sorted_doc_scores = self.dense_passage_retrieval(query)
+        normalized_dpr_sorted_scores = min_max_normalize(dpr_sorted_doc_scores)
+        
+        for i, dpr_sorted_doc_id in enumerate(dpr_sorted_doc_ids.tolist()):
+            passage_node_key = self.passage_node_keys[dpr_sorted_doc_id]
+            passage_dpr_score = normalized_dpr_sorted_scores[i]
+            passage_node_id = self.node_name_to_vertex_idx[passage_node_key]
+            passage_weights[passage_node_id] = passage_dpr_score * passage_node_weight
+            passage_node_text = self.chunk_embedding_store.get_row(passage_node_key)["content"]
+            linking_score_map[passage_node_text] = passage_dpr_score * passage_node_weight
+        
+        # Combining phrase and passage scores into one array for PPR
+        node_weights = phrase_weights + passage_weights
+        
+        # Recording top 30 facts in linking_score_map
+        if len(linking_score_map) > 30:
+            linking_score_map = dict(sorted(linking_score_map.items(), key=lambda x: x[1], reverse=True)[:30])
+        
+        assert sum(node_weights) > 0, f'No phrases found in the graph for the given facts: {top_k_facts}'
+        
+        # Get fact_edge_meta and passage_entity_edges if they exist
+        fact_edge_meta = getattr(self, 'fact_edge_meta', {})
+        passage_entity_edges = getattr(self, 'passage_entity_edges', [])
+        
+        # Run relation-aware PPR
+        ppr_start = time.time()
+        ppr_sorted_doc_ids, ppr_sorted_doc_scores = run_relation_aware_ppr(
+            graph=self.graph,
+            reset_prob=node_weights,
+            relation_influence_factors=relation_influence_factors,
+            fact_edge_meta=fact_edge_meta,
+            passage_entity_edges=passage_entity_edges,
+            node_name_to_vertex_idx=self.node_name_to_vertex_idx,
+            entity_node_keys=self.entity_node_keys,
+            passage_node_keys=self.passage_node_keys,
+            damping=self.global_config.damping
+        )
+        ppr_end = time.time()
+        
+        self.ppr_time += (ppr_end - ppr_start)
+        
+        assert len(ppr_sorted_doc_ids) == len(
+            self.passage_node_idxs), f"Doc prob length {len(ppr_sorted_doc_ids)} != corpus length {len(self.passage_node_idxs)}"
+        
+        return ppr_sorted_doc_ids, ppr_sorted_doc_scores
 
     def rerank_facts(self, query: str, query_fact_scores: np.ndarray) -> Tuple[List[int], List[Tuple], dict]:
         """

@@ -8,8 +8,14 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
+import warnings
 from pathlib import Path
 from typing import Sequence, Dict
+
+# Suppress vLLM/CUDA warnings that don't affect HTTP API usage
+warnings.filterwarnings('ignore', category=UserWarning, module='vllm')
+warnings.filterwarnings('ignore', message='.*Triton.*')
+warnings.filterwarnings('ignore', message='.*libcuda.*')
 
 from tqdm import tqdm
 
@@ -20,8 +26,14 @@ from hipporag.utils.config_utils import BaseConfig
 from hipporag.llm.openai_gpt import CacheOpenAI
 from hipporag.information_extraction.openie_openai import OpenIE
 from hipporag.utils.misc_utils import TripleRawOutput
+from hipporag.utils.logging_utils import get_logger
 
 from experiment.common.io_utils import build_experiment_dir, read_jsonl, write_jsonl, write_json
+
+# Set logging level to DEBUG to see extraction details
+logger = get_logger(__name__)
+import logging
+logging.basicConfig(level=logging.DEBUG, format='%(levelname)s %(asctime)s [%(name)s:%(lineno)d] %(message)s')
 
 
 def init_openie(llm_name: str, llm_base_url: str, cache_root: Path) -> OpenIE:
