@@ -12,9 +12,11 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
+import time
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import requests
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -77,6 +79,46 @@ def run_ner(openie: OpenIE, chunks: list[dict], max_workers: int) -> Iterable[di
             yield future.result()
 
 
+def wait_for_vllm_server(base_url: str, max_wait_seconds: int = 300, check_interval: int = 5) -> None:
+    """
+    Wait for the vLLM server to be ready by checking the /v1/models endpoint.
+    
+    Args:
+        base_url: Base URL of the vLLM server (e.g., http://host:8000/v1)
+        max_wait_seconds: Maximum time to wait in seconds (default: 5 minutes)
+        check_interval: Seconds between health checks (default: 5)
+    
+    Raises:
+        ConnectionError: If server is not ready after max_wait_seconds
+    """
+    models_url = f"{base_url.rstrip('/v1')}/v1/models"
+    start_time = time.time()
+    
+    print(f"Waiting for vLLM server at {base_url}...")
+    while time.time() - start_time < max_wait_seconds:
+        try:
+            response = requests.get(models_url, timeout=5)
+            if response.status_code == 200:
+                models = response.json()
+                print(f"✓ vLLM server is ready! Available models: {[m.get('id') for m in models.get('data', [])]}")
+                return
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            elapsed = int(time.time() - start_time)
+            print(f"  Server not ready yet (waited {elapsed}s)... retrying in {check_interval}s")
+            time.sleep(check_interval)
+        except Exception as e:
+            print(f"  Unexpected error checking server: {e}")
+            time.sleep(check_interval)
+    
+    raise ConnectionError(
+        f"vLLM server at {base_url} did not become ready after {max_wait_seconds} seconds. "
+        f"Please check:\n"
+        f"  1. Is the vLLM server job running? (squeue -u $USER)\n"
+        f"  2. Is the server listening on the correct host/port?\n"
+        f"  3. Check server logs: /n/netscratch/tambe_lab/Lab/msong300/cs2821r-results/logs/vllm-qwen-*.out"
+    )
+
+
 def init_openie(llm_name: str, llm_base_url: str, cache_root: Path) -> OpenIE:
     config = BaseConfig(
         save_dir=str(cache_root),
@@ -118,6 +160,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     write_jsonl(chunks_path, chunks)
 
+    # Wait for vLLM server to be ready before starting NER
+    wait_for_vllm_server(args.llm_base_url)
+    
     openie = init_openie(args.llm_model_name, args.llm_base_url, cache_dir)
     ner_records = list(run_ner(openie, chunks, max_workers=args.max_workers))
     write_jsonl(ner_path, ner_records)

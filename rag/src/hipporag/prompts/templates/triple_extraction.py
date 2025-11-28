@@ -1,11 +1,11 @@
 from .ner import one_shot_ner_paragraph, one_shot_ner_output
 from ...utils.llm_utils import convert_format_to_template
 
-ner_conditioned_re_system ="""Your task is to construct an RDF-style knowledge graph 
-from the given passages and named entity lists.
+ner_conditioned_re_system ="""You are a knowledge extraction system. Extract factual relations from passages and output ONLY valid JSON.
 
-You MUST extract factual relations and respond with a JSON object of the form:
+CRITICAL: Output ONLY the JSON object. Do NOT include reasoning, explanations, or any other text.
 
+Output format (JSON only):
 {
   "triples": [
     ["subject", "predicate", "object", "relation_type", confidence],
@@ -13,38 +13,42 @@ You MUST extract factual relations and respond with a JSON object of the form:
   ]
 }
 
-Relation Types (choose ONE for each triple):
-- HIERARCHICAL  : is_a, part_of, subclass_of, capital_of, membership relations.
-- TEMPORAL      : founded_in, started_on, occurred_in, birth date, time expressions.
-- SPATIAL       : located_in, adjacent_to, inside, contains, geographic relations.
-- CAUSALITY     : causes, results_in, leads_to, enables.
-- ATTRIBUTION   : created_by, painted_by, owned_by, has_property, offers, plays.
+Relation Types (choose ONE per triple):
+- HIERARCHICAL: is_a, part_of, subclass_of, capital_of, membership, spouse, child, parent
+- TEMPORAL: founded_in, started_on, occurred_in, birth_date, first_appearance, last_appearance
+- SPATIAL: located_in, adjacent_to, inside, contains, geographic relations
+- CAUSALITY: causes, results_in, leads_to, enables, created_by
+- ATTRIBUTION: painted_by, owned_by, has_property, offers, plays, portrayed_by, occupation
 
-Confidence Score (float in [0,1]):
-- 0.9–1.0 : clear and explicit in the passage.
-- 0.7–0.9 : likely correct, minor ambiguity.
-- 0.5–0.7 : uncertain or weak evidence.
-- <0.5    : do NOT output such relations.
+Confidence (float 0.0-1.0):
+- 0.9-1.0: explicit in passage
+- 0.7-0.9: likely correct, minor ambiguity
+- 0.5-0.7: uncertain evidence
+- <0.5: DO NOT output
 
-Requirements:
-- Each triple should contain at least one, and preferably two, of the named entities in the list.
-- Resolve pronouns to their specific entities.
-- Use ONLY the allowed relation types above.
-- The final output MUST be a single valid JSON object with the key "triples" and no extra text.
+Rules:
+- Each triple must include at least one named entity from the provided list
+- Resolve pronouns to specific entities
+- Use ONLY the 5 relation types listed above
+- Output ONLY valid JSON, no other text
 """
 
-ner_conditioned_re_frame = """Convert the paragraph into a JSON dict. 
-The JSON dict must contain:
-- a named entity list (copied from the given named_entity_json),
-- a triple list named "triples", where each triple is
-  ["subject", "predicate", "object", "relation_type", confidence].
+ner_conditioned_re_frame = """Extract triples from this passage. Use the named entities provided.
 
-```
+Passage:
 {passage}
-```
 
+Named entities:
 {named_entity_json}
-"""
+
+Output ONLY a JSON object with this exact structure:
+{
+  "triples": [
+    ["subject", "predicate", "object", "relation_type", confidence]
+  ]
+}
+
+Do NOT include reasoning. Output ONLY the JSON object."""
 
 
 ner_conditioned_re_input = ner_conditioned_re_frame.format(passage=one_shot_ner_paragraph, named_entity_json=one_shot_ner_output)

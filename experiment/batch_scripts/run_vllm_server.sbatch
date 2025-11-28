@@ -12,7 +12,12 @@ set -eo pipefail
 LOG_ROOT=/n/netscratch/tambe_lab/Lab/msong300/cs2821r-results/logs
 mkdir -p "${LOG_ROOT}"
 
-MODEL_NAME=${MODEL_NAME:-Qwen/Qwen3-8B-Instruct}
+# Cache directories on scratch
+CACHE_ROOT=/n/netscratch/tambe_lab/Lab/msong300
+export HF_HOME="${CACHE_ROOT}/hf_home"
+export HUGGINGFACE_HUB_CACHE="${CACHE_ROOT}/hf_cache"
+
+MODEL_NAME=${MODEL_NAME:-Qwen/Qwen3-8B}
 HOST=${HOST:-0.0.0.0}
 PORT=${PORT:-8000}
 GPU_UTIL=${GPU_UTIL:-0.94}

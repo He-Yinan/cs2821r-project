@@ -69,6 +69,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--llm-model-name", default="Qwen/Qwen3-8B-Instruct", help="LLM model identifier")
     parser.add_argument("--max-workers", type=int, default=4, help="Threads for triple extraction")
     parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=None,
+        help="Limit number of chunks to process (for testing). If None, process all chunks.",
+    )
+    parser.add_argument(
+        "--test-output",
+        action="store_true",
+        help="If set, save output to triples_test.jsonl instead of triples.jsonl",
+    )
+    parser.add_argument(
         "--input-subdir",
         default="offline_indexing/01_chunk_ner",
         help="Where to read chunks/ner if explicit paths not provided",
@@ -97,6 +108,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     ner_records = read_jsonl(ner_path)
     ner_map = {rec["chunk_id"]: rec for rec in ner_records}
 
+    # Limit chunks for testing if requested
+    if args.max_chunks is not None and args.max_chunks > 0:
+        chunk_ids = list(chunks.keys())[:args.max_chunks]
+        chunks = {cid: chunks[cid] for cid in chunk_ids if cid in chunks}
+        print(f"TEST MODE: Processing only {len(chunks)} chunks (limited from {len(chunk_records)})")
+
+    # Determine output filename
+    if args.test_output:
+        triples_path = output_dir / "triples_test.jsonl"
+        manifest_path = output_dir / "manifest_test.json"
+        print(f"TEST MODE: Saving to {triples_path}")
+    else:
+        triples_path = output_dir / "triples.jsonl"
+        manifest_path = output_dir / "manifest.json"
+
     openie = init_openie(args.llm_model_name, args.llm_base_url, cache_dir)
     triple_records = list(run_triples(openie, chunks, ner_map, args.max_workers))
     write_jsonl(triples_path, triple_records)
@@ -107,9 +133,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "triples_path": str(triples_path),
         "num_chunks": len(chunks),
         "num_triples": len(triple_records),
+        "max_chunks_limit": args.max_chunks,
+        "test_mode": args.test_output,
     }
     write_json(manifest_path, manifest)
     print(f"Triple outputs saved to {triples_path}")
+    print(f"Total triples extracted: {sum(len(rec.get('triples', [])) for rec in triple_records)}")
 
 
 if __name__ == "__main__":

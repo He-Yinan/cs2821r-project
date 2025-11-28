@@ -42,13 +42,59 @@ def _extract_ner_from_response(real_response: str) -> List[str]:
 def _extract_triples_from_response(real_response: str) -> List[Dict[str, Any]]:
     """
     从 LLM 输出中解析出 {"triples": [...]} 里的三元组列表。
+    支持从包含推理文本的响应中提取 JSON。
     """
-    pattern = r'\{[^{}]*"triples"\s*:\s*\[[^\]]*\][^{}]*\}'
-    match = re.search(pattern, real_response, re.DOTALL)
-    if match is None:
-        # If pattern doesn't match, return an empty list
-        return []
-    return eval(match.group())["triples"]
+    import json
+    
+    # First, try to find JSON object with "triples" key using a more robust pattern
+    # Look for { ... "triples": [...] ... } even if nested or has extra content
+    json_pattern = r'\{[^{}]*(?:"triples"\s*:\s*\[[^\]]*\])[^{}]*\}'
+    matches = re.finditer(json_pattern, real_response, re.DOTALL)
+    
+    for match in matches:
+        json_str = match.group()
+        try:
+            # Try to parse as JSON
+            parsed = json.loads(json_str)
+            if "triples" in parsed and isinstance(parsed["triples"], list):
+                return parsed["triples"]
+        except json.JSONDecodeError:
+            continue
+    
+    # Fallback: try to find JSON block between ```json and ``` or just ```
+    code_block_pattern = r'```(?:json)?\s*(\{.*?"triples".*?\})\s*```'
+    code_match = re.search(code_block_pattern, real_response, re.DOTALL)
+    if code_match:
+        try:
+            parsed = json.loads(code_match.group(1))
+            if "triples" in parsed and isinstance(parsed["triples"], list):
+                return parsed["triples"]
+        except json.JSONDecodeError:
+            pass
+    
+    # Last resort: try to find the largest JSON-like structure
+    # Look for balanced braces containing "triples"
+    brace_count = 0
+    start_idx = real_response.find('{"triples"')
+    if start_idx == -1:
+        start_idx = real_response.find("{\"triples\"")
+    if start_idx != -1:
+        for i in range(start_idx, len(real_response)):
+            if real_response[i] == '{':
+                brace_count += 1
+            elif real_response[i] == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    json_str = real_response[start_idx:i+1]
+                    try:
+                        parsed = json.loads(json_str)
+                        if "triples" in parsed and isinstance(parsed["triples"], list):
+                            return parsed["triples"]
+                    except json.JSONDecodeError:
+                        break
+    
+    # If all else fails, return empty list
+    return []
 
 
 def _normalize_relation_type(rtype: str) -> str:
@@ -152,9 +198,10 @@ class OpenIE:
         raw_response = ""
         metadata: Dict[str, Any] = {}
         try:
-            # LLM INFERENCE
+            # LLM INFERENCE with higher max_tokens for complete JSON output
             raw_response, metadata, cache_hit = self.llm_model.infer(
                 messages=messages,
+                max_completion_tokens=4096,  # Increased from default to handle longer outputs
             )
             metadata['cache_hit'] = cache_hit
             if metadata.get('finish_reason') == 'length':
@@ -167,20 +214,48 @@ class OpenIE:
             # 统一规范为 typed triples
             typed_triples: List[Dict[str, Any]] = []
             for t in extracted_triples:
-                subj = str(t.get("subject", "")).strip()
-                pred = str(t.get("predicate", "")).strip()
-                obj = str(t.get("object", "")).strip()
+                # Handle both dict and list/tuple formats
+                if isinstance(t, (list, tuple)):
+                    if len(t) >= 5:
+                        # Full format: [subject, predicate, object, relation_type, confidence]
+                        subj = str(t[0]).strip()
+                        pred = str(t[1]).strip()
+                        obj = str(t[2]).strip()
+                        rtype = _normalize_relation_type(str(t[3]).strip() if len(t) > 3 else "ATTRIBUTION")
+                        try:
+                            conf = float(t[4]) if len(t) > 4 else 0.5
+                        except (TypeError, ValueError):
+                            conf = 0.5
+                    elif len(t) >= 3:
+                        # Minimal format: [subject, predicate, object]
+                        subj = str(t[0]).strip()
+                        pred = str(t[1]).strip()
+                        obj = str(t[2]).strip()
+                        rtype = "ATTRIBUTION"  # Default for list format
+                        conf = 0.5  # Default confidence
+                    elif len(t) == 2:
+                        # Incomplete triple: [subject, predicate] - skip silently
+                        continue
+                    else:
+                        # Invalid length - skip silently
+                        continue
+                elif isinstance(t, dict):
+                    # Dict format: {"subject": ..., "predicate": ..., "object": ..., ...}
+                    subj = str(t.get("subject", "")).strip()
+                    pred = str(t.get("predicate", "")).strip()
+                    obj = str(t.get("object", "")).strip()
+                    rtype = _normalize_relation_type(t.get("relation_type", ""))
+                    try:
+                        conf = float(t.get("confidence", 0.5))
+                    except (TypeError, ValueError):
+                        conf = 0.5
+                else:
+                    # Unknown format - skip silently (was causing too many warnings)
+                    continue
 
                 # 主语或宾语缺失就丢弃
                 if not subj or not obj:
                     continue
-
-                rtype = _normalize_relation_type(t.get("relation_type", ""))
-
-                try:
-                    conf = float(t.get("confidence", 0.5))
-                except (TypeError, ValueError):
-                    conf = 0.5
                 # clamp 到 [0, 1]
                 conf = max(0.0, min(1.0, conf))
 
