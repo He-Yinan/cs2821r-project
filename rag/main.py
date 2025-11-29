@@ -80,7 +80,7 @@ def main():
     parser.add_argument('--force_openie_from_scratch', type=str, default='false', help='If set to False, will try to first reuse openie results for the corpus if they exist.')
     parser.add_argument('--openie_mode', choices=['online', 'offline'], default='online',
                         help="OpenIE mode, offline denotes using VLLM offline batch mode for indexing, while online denotes")
-    parser.add_argument('--save_dir', type=str, default='outputs', help='Save directory')
+    parser.add_argument('--save_dir', type=str, default='/n/holylabs/ydu_lab/Lab/yinan/28-results/outputs', help='Save directory')
     args = parser.parse_args()
 
     dataset_name = args.dataset
@@ -92,7 +92,8 @@ def main():
     else:
         save_dir = save_dir + '_' + dataset_name
 
-    corpus_path = f"reproduce/dataset/{dataset_name}_corpus.json"
+    # corpus_path = f"reproduce/dataset/{dataset_name}_corpus.json"  # OLD
+    corpus_path = f"/n/holylabs/ydu_lab/Lab/yinan/28-results/datasets/{dataset_name}/subset_200/{dataset_name}_corpus.json"
     # corpus_path = f"hipporag/reproduce/dataset/{dataset_name}_corpus.json"  # MINE
     with open(corpus_path, "r") as f:
         corpus = json.load(f)
@@ -103,7 +104,8 @@ def main():
     force_openie_from_scratch = string_to_bool(args.force_openie_from_scratch)
 
     # Prepare datasets and evaluation
-    samples = json.load(open(f"reproduce/dataset/{dataset_name}.json", "r"))
+    # samples = json.load(open(f"reproduce/dataset/{dataset_name}.json", "r"))  # OLD
+    samples = json.load(open(f"/n/holylabs/ydu_lab/Lab/yinan/28-results/datasets/{dataset_name}/subset_200/{dataset_name}.json", "r"))
     # samples = json.load(open(f"hipporag/reproduce/dataset/{dataset_name}.json", "r"))  # MINE
     all_queries = [s['question'] for s in samples]
 
