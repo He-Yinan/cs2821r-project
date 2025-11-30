@@ -40,6 +40,7 @@ class QuerySolution:
     question: str
     docs: List[str]
     doc_scores: np.ndarray = None
+    doc_ids: Optional[List[str]] = None  # Chunk IDs for the retrieved documents
     answer: str = None
     gold_answers: List[str] = None
     gold_docs: Optional[List[str]] = None
@@ -206,6 +207,8 @@ def flatten_facts(chunk_triples: List[Triple]) -> List[Triple]:
 
     注意：
     - 即使 triple 是 dict，也只取 subject/predicate/object 三个字段。
+    - 为了保持一致性，所有 facts 都存储为 tuple 格式，但 relation_type 信息
+      已经保存在 graph edges 中，可以通过 graph 查询获取。
     """
     graph_triples = []  # a list of unique relation triple (in tuple) from all chunks
     for triples in chunk_triples:
@@ -216,9 +219,14 @@ def flatten_facts(chunk_triples: List[Triple]) -> List[Triple]:
                 obj = t.get("object")
                 if subj is None or obj is None:
                     continue
+                # Store as tuple for fact embedding
+                # Note: relation_type is preserved in graph edges, not in fact strings
                 tup = (str(subj), str(pred), str(obj))
+            elif isinstance(t, (list, tuple)) and len(t) >= 3:
+                # Plain triple format
+                tup = tuple(str(t[i]) for i in range(min(3, len(t))))
             else:
-                tup = tuple(t)
+                continue
             graph_triples.append(tup)
 
     graph_triples = list(set(graph_triples))

@@ -27,3 +27,10 @@ echo "Cache directories configured to use: ${CACHE_ROOT}"
 echo "Run your vLLM command now, e.g.:"
 echo "  CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-8B --dtype bfloat16 --max-model-len 12288 --gpu-memory-utilization 0.94 --download-dir ${CACHE_ROOT}/vllm_cache"
 
+
+
+
+
+
+
+

@@ -20,6 +20,9 @@ EXPERIMENT_NAME=${EXPERIMENT_NAME:-musique_demo}
 LLM_MODEL_NAME=${LLM_MODEL_NAME:-Qwen/Qwen3-8B}
 EMBED_MODEL_NAME=${EMBED_MODEL_NAME:-facebook/contriever-msmarco}
 LLM_BASE_URL=${LLM_BASE_URL:-http://holygpu7c26106.rc.fas.harvard.edu:8000/v1}
+CHUNK_DIR=${CHUNK_DIR:-offline_indexing/01_chunk_ner_50}
+TRIPLE_DIR=${TRIPLE_DIR:-offline_indexing/02_triples_50}
+OUTPUT_SUBDIR=${OUTPUT_SUBDIR:-offline_indexing/04_graph_50}
 
 export BASHRCSOURCED=1
 source ~/.bashrc
@@ -30,6 +33,9 @@ python experiment/offline_indexing/04_build_graph.py \
   --experiment-name "${EXPERIMENT_NAME}" \
   --llm-model-name "${LLM_MODEL_NAME}" \
   --embedding-model-name "${EMBED_MODEL_NAME}" \
-  --llm-base-url "${LLM_BASE_URL}"
+  --llm-base-url "${LLM_BASE_URL}" \
+  --chunk-dir "${CHUNK_DIR}" \
+  --triple-dir "${TRIPLE_DIR}" \
+  --output-subdir "${OUTPUT_SUBDIR}"
 
 

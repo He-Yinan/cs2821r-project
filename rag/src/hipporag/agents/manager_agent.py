@@ -72,9 +72,23 @@ class ManagerAgent:
             llm_response = self.llm.infer(messages=messages)
             
             # Parse response
+            # The infer method returns (message, metadata, cache_hit) due to cache decorator
             if isinstance(llm_response, tuple):
-                response_messages, metadata = llm_response
-                if isinstance(response_messages, list) and len(response_messages) > 0:
+                if len(llm_response) == 3:
+                    # Cache-enabled: (message, metadata, cache_hit)
+                    response_messages, metadata, cache_hit = llm_response
+                elif len(llm_response) == 2:
+                    # Non-cached: (message, metadata)
+                    response_messages, metadata = llm_response
+                else:
+                    # Fallback: assume first element is the message
+                    response_messages = llm_response[0]
+                    metadata = llm_response[1] if len(llm_response) > 1 else {}
+                
+                # Extract content from response_messages
+                if isinstance(response_messages, str):
+                    response_content = response_messages
+                elif isinstance(response_messages, list) and len(response_messages) > 0:
                     response_content = response_messages[0].get('content', '') if isinstance(response_messages[0], dict) else str(response_messages[0])
                 else:
                     response_content = str(response_messages)
@@ -102,16 +116,20 @@ class ManagerAgent:
         """
         Parse JSON response from LLM.
         
+        Handles cases where LLM includes reasoning text before/after JSON.
+        
         Args:
             response_content: Raw response content from LLM
             
         Returns:
             Parsed beta values dictionary
         """
+        import re
+        
         # Try to extract JSON from response
         response_content = response_content.strip()
         
-        # Remove markdown code blocks if present
+        # Strategy 1: Remove markdown code blocks if present
         if response_content.startswith('```'):
             lines = response_content.split('\n')
             # Remove first line (```json or ```)
@@ -121,35 +139,106 @@ class ManagerAgent:
             if response_content.endswith('```'):
                 response_content = response_content[:-3].strip()
         
-        # Try to find JSON object
+        # Strategy 2: Find all potential JSON objects by matching braces
+        # Look for patterns that might be JSON objects
+        potential_jsons = []
+        i = 0
+        while i < len(response_content):
+            if response_content[i] == '{':
+                # Found start of potential JSON, try to find matching closing brace
+                brace_count = 0
+                start = i
+                for j in range(i, len(response_content)):
+                    if response_content[j] == '{':
+                        brace_count += 1
+                    elif response_content[j] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            # Found complete JSON object
+                            potential_jsons.append((start, j + 1))
+                            i = j + 1
+                            break
+                else:
+                    i += 1
+            else:
+                i += 1
+        
+        # Try each potential JSON object
+        for start, end in potential_jsons:
+            json_str = response_content[start:end]
+            try:
+                beta_values = json.loads(json_str)
+                # Validate it has the required structure
+                if isinstance(beta_values, dict) and 'entity_entity' in beta_values and 'entity_passage' in beta_values:
+                    return beta_values
+            except json.JSONDecodeError:
+                continue
+        
+        # Strategy 3: Find first complete JSON object by matching braces
         start_idx = response_content.find('{')
-        end_idx = response_content.rfind('}')
+        if start_idx >= 0:
+            brace_count = 0
+            end_idx = -1
+            for i in range(start_idx, len(response_content)):
+                if response_content[i] == '{':
+                    brace_count += 1
+                elif response_content[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i
+                        break
+            
+            if end_idx > start_idx:
+                json_str = response_content[start_idx:end_idx + 1]
+                try:
+                    beta_values = json.loads(json_str)
+                    # Validate structure
+                    if isinstance(beta_values, dict) and 'entity_entity' in beta_values and 'entity_passage' in beta_values:
+                        return beta_values
+                except json.JSONDecodeError:
+                    pass
         
-        if start_idx >= 0 and end_idx > start_idx:
-            json_str = response_content[start_idx:end_idx + 1]
-        else:
-            json_str = response_content
+        # Strategy 4: Try to find JSON after common prefixes
+        # Sometimes LLM adds "Here's the JSON:" or similar
+        for prefix in ['json:', '```json', '```', 'output:', 'response:']:
+            idx = response_content.lower().find(prefix.lower())
+            if idx >= 0:
+                # Try to find JSON after this prefix
+                remaining = response_content[idx + len(prefix):].strip()
+                start_idx = remaining.find('{')
+                if start_idx >= 0:
+                    brace_count = 0
+                    end_idx = -1
+                    for i in range(start_idx, len(remaining)):
+                        if remaining[i] == '{':
+                            brace_count += 1
+                        elif remaining[i] == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                end_idx = i
+                                break
+                    
+                    if end_idx > start_idx:
+                        json_str = remaining[start_idx:end_idx + 1]
+                        try:
+                            beta_values = json.loads(json_str)
+                            if isinstance(beta_values, dict) and 'entity_entity' in beta_values and 'entity_passage' in beta_values:
+                                return beta_values
+                        except json.JSONDecodeError:
+                            continue
         
-        # Parse JSON
+        # Strategy 5: Try parsing the entire response (in case it's just JSON)
         try:
-            beta_values = json.loads(json_str)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON response: {e}")
-            logger.warning(f"Response content: {response_content[:500]}")
-            raise ValueError(f"Invalid JSON response: {e}")
+            beta_values = json.loads(response_content)
+            if isinstance(beta_values, dict) and 'entity_entity' in beta_values and 'entity_passage' in beta_values:
+                return beta_values
+        except json.JSONDecodeError:
+            pass
         
-        # Validate structure
-        if not isinstance(beta_values, dict):
-            raise ValueError("Response is not a dictionary")
-        
-        required_keys = ['entity_entity', 'entity_passage']
-        for key in required_keys:
-            if key not in beta_values:
-                raise ValueError(f"Missing required key: {key}")
-            if not isinstance(beta_values[key], dict):
-                raise ValueError(f"Value for {key} is not a dictionary")
-        
-        return beta_values
+        # If all strategies fail, log and raise error
+        logger.warning(f"Failed to extract valid JSON from response")
+        logger.warning(f"Response content (first 1000 chars): {response_content[:1000]}")
+        raise ValueError("Could not extract valid JSON from LLM response")
     
     def _validate_and_normalize(self, beta_values: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
         """
@@ -212,18 +301,21 @@ class ManagerAgent:
         """
         Get uniform relation influence factors as fallback.
         
+        CRITICAL FIX: Use beta=1.0 for all types when manager agent fails.
+        This ensures no edge downweighting occurs, matching baseline behavior.
+        Previously used 1.0/len(types) which heavily downweighted all edges.
+        
         Returns:
-            Uniform beta values (all equal within each category)
+            Uniform beta values (all 1.0 to preserve baseline edge weights)
         """
         entity_entity_types = ['HIERARCHICAL', 'TEMPORAL', 'SPATIAL', 'CAUSALITY', 'ATTRIBUTION']
         entity_passage_types = ['PRIMARY', 'SECONDARY', 'PERIPHERAL']
         
-        uniform_ee = 1.0 / len(entity_entity_types)
-        uniform_ep = 1.0 / len(entity_passage_types)
-        
+        # Use 1.0 for all types - this means no modification to edge weights
+        # This is better than downweighting all edges when manager agent fails
         return {
-            'entity_entity': {rtype: uniform_ee for rtype in entity_entity_types},
-            'entity_passage': {rtype: uniform_ep for rtype in entity_passage_types}
+            'entity_entity': {rtype: 1.0 for rtype in entity_entity_types},
+            'entity_passage': {rtype: 1.0 for rtype in entity_passage_types}
         }
     
     def _create_fallback_prompt(self, query: str) -> list:

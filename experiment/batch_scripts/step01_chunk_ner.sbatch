@@ -20,10 +20,11 @@ export HUGGINGFACE_HUB_CACHE="${CACHE_ROOT}/hf_cache"
 
 # ---- user-configurable variables ----
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-musique_demo}
-CORPUS_FILE=${CORPUS_FILE:-/n/netscratch/tambe_lab/Lab/msong300/cs2821r-results/datasets/musique/subset_200/musique_corpus.json}
+CORPUS_FILE=${CORPUS_FILE:-/n/netscratch/tambe_lab/Lab/msong300/cs2821r-results/datasets/musique/subset_50/musique_corpus.json}
 LLM_BASE_URL=${LLM_BASE_URL:-http://holygpu7c26106.rc.fas.harvard.edu:8000/v1}
 LLM_MODEL_NAME=${LLM_MODEL_NAME:-Qwen/Qwen3-8B}
 MAX_WORKERS=${MAX_WORKERS:-8}
+OUTPUT_SUBDIR=${OUTPUT_SUBDIR:-offline_indexing/01_chunk_ner_50}
 
 # ---- environment setup (edit as needed) ----
 export BASHRCSOURCED=1
@@ -36,4 +37,5 @@ python experiment/offline_indexing/01_chunk_and_ner.py \
   --corpus-file "${CORPUS_FILE}" \
   --llm-base-url "${LLM_BASE_URL}" \
   --llm-model-name "${LLM_MODEL_NAME}" \
-  --max-workers "${MAX_WORKERS}"
+  --max-workers "${MAX_WORKERS}" \
+  --output-subdir "${OUTPUT_SUBDIR}"

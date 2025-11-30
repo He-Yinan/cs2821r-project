@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=embeddings
+#SBATCH --job-name=graphcleanup
 #SBATCH --partition=shared
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=06:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=02:00:00
 #SBATCH --output=/n/netscratch/tambe_lab/Lab/msong300/cs2821r-results/logs/%x-%j.out
 #SBATCH --error=/n/netscratch/tambe_lab/Lab/msong300/cs2821r-results/logs/%x-%j.err
 
@@ -19,23 +19,24 @@ export HUGGINGFACE_HUB_CACHE="${CACHE_ROOT}/hf_cache"
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-musique_demo}
 LLM_MODEL_NAME=${LLM_MODEL_NAME:-Qwen/Qwen3-8B}
 EMBED_MODEL_NAME=${EMBED_MODEL_NAME:-facebook/contriever-msmarco}
-EMBED_BATCH_SIZE=${EMBED_BATCH_SIZE:-32}
-CHUNK_DIR=${CHUNK_DIR:-offline_indexing/01_chunk_ner_50}
-TRIPLE_DIR=${TRIPLE_DIR:-offline_indexing/02_triples_50}
-OUTPUT_SUBDIR=${OUTPUT_SUBDIR:-offline_indexing/03_embeddings_50}
+INPUT_SUBDIR=${INPUT_SUBDIR:-offline_indexing/04_graph_50}
+OUTPUT_SUBDIR=${OUTPUT_SUBDIR:-offline_indexing/05_graph_cleaned_50}
 
 export BASHRCSOURCED=1
 source ~/.bashrc
 conda activate hipporag
 cd /n/home00/msong300/cs2821r-project
 
-python experiment/offline_indexing/03_encode_embeddings.py \
+python experiment/offline_indexing/05_cleanup_graph.py \
   --experiment-name "${EXPERIMENT_NAME}" \
   --llm-model-name "${LLM_MODEL_NAME}" \
   --embedding-model-name "${EMBED_MODEL_NAME}" \
-  --embedding-batch-size "${EMBED_BATCH_SIZE}" \
-  --chunk-dir "${CHUNK_DIR}" \
-  --triple-dir "${TRIPLE_DIR}" \
+  --input-subdir "${INPUT_SUBDIR}" \
   --output-subdir "${OUTPUT_SUBDIR}"
+
+
+
+
+
 
 

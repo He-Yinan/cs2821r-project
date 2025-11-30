@@ -80,6 +80,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         embedding_model_name=args.embedding_model_name,
         llm_base_url=args.llm_base_url,
         openie_mode="online",
+        force_index_from_scratch=True,  # Force rebuild to ensure relation_type attributes are added
     )
     hipporag = HippoRAG(global_config=config)
 
@@ -90,16 +91,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     chunk_triples = [triple_map.get(cid, {}).get("triples", []) for cid in chunk_ids]
     chunk_entities = [ner_map.get(cid, {}).get("entities", []) for cid in chunk_ids]
 
-    hipporag.node_to_node_stats = {}
+    hipporag.edge_records = []
     hipporag.ent_node_to_chunk_ids = {}
 
     hipporag.add_fact_edges(chunk_ids, chunk_triples)
     num_new_chunks = hipporag.add_passage_edges(chunk_ids, chunk_entities)
 
-    if num_new_chunks > 0:
-        hipporag.add_synonymy_edges()
-        hipporag.augment_graph()
-        hipporag.save_igraph()
+    # Always rebuild graph to ensure relation_type attributes are included
+    # (even if num_new_chunks is 0, we need to rebuild to add relation_type to existing edges)
+    hipporag.add_synonymy_edges()
+    hipporag.augment_graph()
+    hipporag.save_igraph()
 
     write_json(
         output_dir / "manifest.json",

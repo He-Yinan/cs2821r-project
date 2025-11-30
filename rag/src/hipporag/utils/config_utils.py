@@ -80,6 +80,10 @@ class BaseConfig:
         default=0.05,
         metadata={"help": "Multiplicative factor that modified the passage node weights in PPR."}
     )
+    dpr_ppr_hybrid_alpha: float = field(
+        default=0.0,
+        metadata={"help": "Weight for DPR in hybrid scoring (DPR + PPR). 0.0 = PPR only, 1.0 = DPR only, 0.5 = balanced. Set to 0.0 to disable hybrid scoring."}
+    )
     save_openie: bool = field(
         default=True,
         metadata={"help": "If set to True, will save the OpenIE model to disk."}

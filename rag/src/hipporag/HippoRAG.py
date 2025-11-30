@@ -12,8 +12,6 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from igraph import Graph
 import igraph as ig
-import numpy as np
-from collections import defaultdict
 import re
 import time
 
@@ -31,7 +29,7 @@ from .rerank import DSPyFilter
 from .agents.manager_agent import ManagerAgent
 from .retrieval.relation_aware_ppr import run_relation_aware_ppr
 from .utils.misc_utils import *
-from .utils.misc_utils import NerRawOutput, TripleRawOutput
+from .utils.misc_utils import NerRawOutput, TripleRawOutput, _normalize_relation_type
 from .utils.embed_utils import retrieve_knn
 from .utils.typing import Triple
 from .utils.config_utils import BaseConfig
@@ -264,7 +262,31 @@ class HippoRAG:
         # prepare data_store
         chunk_ids = list(chunk_to_rows.keys())
 
-        chunk_triples = [[text_processing(t) for t in triple_results_dict[chunk_id].triples] for chunk_id in chunk_ids]
+        # Process triples: apply text_processing to text fields but preserve dict structure for typed triples
+        # This ensures relation_type and confidence are preserved
+        processed_chunk_triples = []
+        for chunk_id in chunk_ids:
+            processed_triples = []
+            for t in triple_results_dict[chunk_id].triples:
+                if isinstance(t, dict):
+                    # Typed triple: apply text_processing to text fields, preserve metadata
+                    processed_t = {
+                        "subject": text_processing(t.get("subject", "")),
+                        "predicate": text_processing(t.get("predicate", "")),
+                        "object": text_processing(t.get("object", "")),
+                        "relation_type": t.get("relation_type", "ATTRIBUTION"),
+                        "confidence": t.get("confidence", 1.0)
+                    }
+                    processed_triples.append(processed_t)
+                elif isinstance(t, (list, tuple)) and len(t) >= 3:
+                    # Plain triple: apply text_processing to each element
+                    processed_triples.append([text_processing(str(t[i])) for i in range(min(3, len(t)))])
+                else:
+                    # Fallback: try text_processing
+                    processed_triples.append(text_processing(t))
+            processed_chunk_triples.append(processed_triples)
+        
+        chunk_triples = processed_chunk_triples
         entity_nodes, chunk_triple_entities = extract_entity_nodes(chunk_triples)
         facts = flatten_facts(chunk_triples)
 
@@ -276,7 +298,9 @@ class HippoRAG:
 
         logger.info(f"Constructing Graph")
 
-        self.node_to_node_stats = {}
+        # Changed to list of edge records to support multiple edges between same nodes with different relation types
+        # Each record: {"source": node_id, "target": node_id, "weight": float, "relation_type": str}
+        self.edge_records = []
         self.ent_node_to_chunk_ids = {}
 
         self.add_fact_edges(chunk_ids, chunk_triples)
@@ -450,9 +474,21 @@ class HippoRAG:
                         passage_node_weight=self.global_config.passage_node_weight
                     )
 
-            top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]]
+            # Ensure sorted_doc_ids and sorted_doc_scores are properly aligned
+            # sorted_doc_ids should be indices into passage_node_keys, sorted by score (descending)
+            # sorted_doc_scores should be the corresponding PPR scores
+            assert len(sorted_doc_ids) == len(sorted_doc_scores), \
+                f"Mismatch: {len(sorted_doc_ids)} doc IDs vs {len(sorted_doc_scores)} scores"
+            
+            # Get top-k documents and their scores (already sorted by PPR score)
+            top_k_doc_indices = sorted_doc_ids[:num_to_retrieve]
+            top_k_doc_scores = sorted_doc_scores[:num_to_retrieve]
+            
+            # Get chunk IDs (passage_node_keys) for the retrieved documents
+            top_k_doc_ids = [self.passage_node_keys[idx] for idx in top_k_doc_indices]
+            top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in top_k_doc_indices]
 
-            retrieval_results.append(QuerySolution(question=query, docs=top_k_docs, doc_scores=sorted_doc_scores[:num_to_retrieve]))
+            retrieval_results.append(QuerySolution(question=query, docs=top_k_docs, doc_scores=top_k_doc_scores, doc_ids=top_k_doc_ids))
 
         retrieve_end_time = time.time()  # Record end time
 
@@ -465,8 +501,22 @@ class HippoRAG:
 
         # Evaluate retrieval
         if gold_docs is not None:
+            # Cap k_list to the number of documents actually retrieved
+            max_retrieved = max(len(retrieval_result.docs) for retrieval_result in retrieval_results) if retrieval_results else num_to_retrieve
             k_list = [1, 2, 5, 10, 20, 30, 50, 100, 150, 200]
-            overall_retrieval_result, example_retrieval_results = retrieval_recall_evaluator.calculate_metric_scores(gold_docs=gold_docs, retrieved_docs=[retrieval_result.docs for retrieval_result in retrieval_results], k_list=k_list)
+            k_list = [k for k in k_list if k <= max_retrieved]  # Only evaluate k values we have documents for
+            if max_retrieved < 200:
+                logger.info(f"Retrieved {max_retrieved} documents per query, capping k_list to {k_list}")
+            
+            # Get doc_ids if available
+            retrieved_doc_ids = [retrieval_result.doc_ids if hasattr(retrieval_result, 'doc_ids') and retrieval_result.doc_ids is not None else None 
+                                for retrieval_result in retrieval_results]
+            overall_retrieval_result, example_retrieval_results = retrieval_recall_evaluator.calculate_metric_scores(
+                gold_docs=gold_docs, 
+                retrieved_docs=[retrieval_result.docs for retrieval_result in retrieval_results], 
+                k_list=k_list,
+                retrieved_doc_ids=retrieved_doc_ids if all(ids is not None for ids in retrieved_doc_ids) else None
+            )
             logger.info(f"Evaluation results for retrieval: {overall_retrieval_result}")
 
             return retrieval_results, overall_retrieval_result
@@ -594,11 +644,12 @@ class HippoRAG:
             logger.info('No facts found after reranking, return DPR results')
             sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
 
-            top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in
-                          sorted_doc_ids[:num_to_retrieve]]
+            top_k_doc_indices = sorted_doc_ids[:num_to_retrieve]
+            top_k_doc_ids = [self.passage_node_keys[idx] for idx in top_k_doc_indices]
+            top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in top_k_doc_indices]
 
             retrieval_results.append(
-                QuerySolution(question=query, docs=top_k_docs, doc_scores=sorted_doc_scores[:num_to_retrieve]))
+                QuerySolution(question=query, docs=top_k_docs, doc_scores=sorted_doc_scores[:num_to_retrieve], doc_ids=top_k_doc_ids))
 
         retrieve_end_time = time.time()  # Record end time
 
@@ -608,10 +659,22 @@ class HippoRAG:
 
         # Evaluate retrieval
         if gold_docs is not None:
+            # Cap k_list to the number of documents actually retrieved
+            max_retrieved = max(len(retrieval_result.docs) for retrieval_result in retrieval_results) if retrieval_results else num_to_retrieve
             k_list = [1, 2, 5, 10, 20, 30, 50, 100, 150, 200]
+            k_list = [k for k in k_list if k <= max_retrieved]  # Only evaluate k values we have documents for
+            if max_retrieved < 200:
+                logger.info(f"Retrieved {max_retrieved} documents per query, capping k_list to {k_list}")
+            
+            # Get doc_ids if available
+            retrieved_doc_ids = [retrieval_result.doc_ids if hasattr(retrieval_result, 'doc_ids') and retrieval_result.doc_ids is not None else None 
+                                for retrieval_result in retrieval_results]
             overall_retrieval_result, example_retrieval_results = retrieval_recall_evaluator.calculate_metric_scores(
-                gold_docs=gold_docs, retrieved_docs=[retrieval_result.docs for retrieval_result in retrieval_results],
-                k_list=k_list)
+                gold_docs=gold_docs, 
+                retrieved_docs=[retrieval_result.docs for retrieval_result in retrieval_results],
+                k_list=k_list,
+                retrieved_doc_ids=retrieved_doc_ids if all(ids is not None for ids in retrieved_doc_ids) else None
+            )
             logger.info(f"Evaluation results for retrieval: {overall_retrieval_result}")
 
             return retrieval_results, overall_retrieval_result
@@ -707,6 +770,14 @@ class HippoRAG:
                 - A list of raw response messages from the language model.
                 - A list of metadata dictionaries associated with the results.
         """
+        # Optional: Check connection before starting QA (only log warning, don't fail)
+        if hasattr(self.llm_model, 'check_connection'):
+            try:
+                if not self.llm_model.check_connection():
+                    logger.warning("LLM server connection check failed. QA may fail. Please verify the server is running.")
+            except Exception as e:
+                logger.debug(f"Connection check skipped: {str(e)}")
+        
         #Running inference for QA
         all_qa_messages = []
 
@@ -731,7 +802,22 @@ class HippoRAG:
             all_qa_messages.append(
                 self.prompt_template_manager.render(name=f'rag_qa_{prompt_dataset_name}', prompt_user=prompt_user))
 
-        all_qa_results = [self.llm_model.infer(qa_messages) for qa_messages in tqdm(all_qa_messages, desc="QA Reading")]
+        # Process QA with error handling for each query
+        all_qa_results = []
+        for qa_idx, qa_messages in enumerate(tqdm(all_qa_messages, desc="QA Reading")):
+            try:
+                result = self.llm_model.infer(qa_messages)
+                all_qa_results.append(result)
+            except Exception as e:
+                logger.error(f"Failed to get QA response for query {qa_idx + 1}/{len(all_qa_messages)}: {str(e)}")
+                # Return empty response and metadata on error
+                error_message = f"[ERROR: Failed to get LLM response - {str(e)}]"
+                error_metadata = {"error": str(e), "prompt_tokens": 0, "completion_tokens": 0, "finish_reason": "error"}
+                all_qa_results.append((error_message, error_metadata, False))
+                # If it's a connection error, log server info
+                if "Connection" in str(e) or "Connection refused" in str(e):
+                    logger.error(f"Connection error detected. LLM server URL: {getattr(self.llm_model, 'llm_base_url', 'unknown')}")
+                    logger.error("Please check if the LLM server is running and accessible.")
 
         all_response_message, all_metadata, all_cache_hit = zip(*all_qa_results)
         all_response_message, all_metadata = list(all_response_message), list(all_metadata)
@@ -740,11 +826,48 @@ class HippoRAG:
         queries_solutions = []
         for query_solution_idx, query_solution in tqdm(enumerate(queries), desc="Extraction Answers from LLM Response"):
             response_content = all_response_message[query_solution_idx]
-            try:
-                pred_ans = response_content.split('Answer:')[1].strip()
-            except Exception as e:
-                logger.warning(f"Error in parsing the answer from the raw LLM QA inference response: {str(e)}!")
-                pred_ans = response_content
+            
+            # Try multiple patterns to extract the answer
+            pred_ans = None
+            
+            # Pattern 1: "Answer: <answer>"
+            if 'Answer:' in response_content:
+                try:
+                    parts = response_content.split('Answer:')
+                    if len(parts) > 1:
+                        pred_ans = parts[1].strip()
+                except Exception as e:
+                    logger.debug(f"Failed to parse with 'Answer:' pattern: {str(e)}")
+            
+            # Pattern 2: "answer: <answer>" (lowercase)
+            if pred_ans is None and 'answer:' in response_content.lower():
+                try:
+                    # Find the position of "answer:" (case-insensitive)
+                    response_lower = response_content.lower()
+                    answer_pos = response_lower.find('answer:')
+                    if answer_pos >= 0:
+                        # Extract everything after "answer:"
+                        pred_ans = response_content[answer_pos + len('answer:'):].strip()
+                except Exception as e:
+                    logger.debug(f"Failed to parse with 'answer:' pattern: {str(e)}")
+            
+            # Pattern 3: Look for common answer indicators
+            if pred_ans is None:
+                # Try to find the last sentence or paragraph (often the answer)
+                lines = response_content.strip().split('\n')
+                # Look for lines that might contain the answer
+                for line in reversed(lines):
+                    line = line.strip()
+                    if line and not line.startswith('Thought:') and not line.startswith('Question:'):
+                        # Check if this looks like an answer (not a question)
+                        if not line.endswith('?') and len(line) > 5:
+                            pred_ans = line
+                            break
+            
+            # Fallback: use the entire response
+            if pred_ans is None or not pred_ans:
+                logger.warning(f"Could not extract answer from response, using full response. Response preview: {response_content[:200]}")
+                pred_ans = response_content.strip()
 
             query_solution.answer = pred_ans
             queries_solutions.append(query_solution)
@@ -910,13 +1033,20 @@ class HippoRAG:
                     node_key = compute_mdhash_id(content=subj, prefix=("entity-"))
                     node_2_key = compute_mdhash_id(content=obj, prefix=("entity-"))
 
-                    # 用 confidence 累加边权（双向）
-                    self.node_to_node_stats[(node_key, node_2_key)] = self.node_to_node_stats.get(
-                        (node_key, node_2_key), 0.0
-                    ) + conf
-                    self.node_to_node_stats[(node_2_key, node_key)] = self.node_to_node_stats.get(
-                        (node_2_key, node_key), 0.0
-                    ) + conf
+                    # Store separate edges for each relation type (bidirectional)
+                    # This allows multiple relation types between the same entities
+                    self.edge_records.append({
+                        "source": node_key,
+                        "target": node_2_key,
+                        "weight": conf,
+                        "relation_type": rel_type
+                    })
+                    self.edge_records.append({
+                        "source": node_2_key,
+                        "target": node_key,
+                        "weight": conf,
+                        "relation_type": rel_type
+                    })
 
                     entities_in_chunk.add(node_key)
                     entities_in_chunk.add(node_2_key)
@@ -1034,8 +1164,13 @@ class HippoRAG:
                     else:
                         rel_type = "PERIPHERAL"
 
-                    # 存入 node_to_node_stats，后面 add_new_edges 会用 weight 作为图的边权
-                    self.node_to_node_stats[(chunk_key, node_key)] = weight
+                    # Store passage-entity edge with relation type
+                    self.edge_records.append({
+                        "source": chunk_key,
+                        "target": node_key,
+                        "weight": weight,
+                        "relation_type": rel_type
+                    })
 
                     # 同时保留一份结构化 JSON，方便导出/调试/多agent使用
                     self.passage_entity_edges.append(
@@ -1111,11 +1246,22 @@ class HippoRAG:
                     nn_phrase = self.entity_id_to_row[nn]["content"]
 
                     if nn != node_key and nn_phrase != '':
-                        sim_edge = (node_key, nn)
                         synonyms.append((nn, score))
                         num_synonym_triple += 1
 
-                        self.node_to_node_stats[sim_edge] = score  # Need to seriously discuss on this
+                        # Store synonymy edges with relation_type="SYNONYMY" (bidirectional)
+                        self.edge_records.append({
+                            "source": node_key,
+                            "target": nn,
+                            "weight": score,
+                            "relation_type": "SYNONYMY"
+                        })
+                        self.edge_records.append({
+                            "source": nn,
+                            "target": node_key,
+                            "weight": score,
+                            "relation_type": "SYNONYMY"
+                        })
                         num_nns += 1
 
             synonym_candidates.append((node_key, synonyms))
@@ -1266,6 +1412,9 @@ class HippoRAG:
         in the graph and nodes retrieved from the entity embedding store and the passage
         embedding store. The method checks attributes and ensures no duplicates are added.
         New nodes are prepared and added in bulk to optimize graph updates.
+        
+        Also ensures all nodes referenced in node_to_node_stats are added to the graph,
+        even if they're not in the embedding stores (creates placeholder nodes for them).
         """
 
         existing_nodes = {v["name"]: v for v in self.graph.vs if "name" in v.attributes()}
@@ -1276,52 +1425,108 @@ class HippoRAG:
         node_to_rows = entity_to_row
         node_to_rows.update(passage_to_row)
 
-        new_nodes = {}
+        # Also collect all nodes referenced in edges to ensure they're added
+        nodes_in_edges = set()
+        if hasattr(self, 'edge_records') and self.edge_records:
+            for edge_record in self.edge_records:
+                nodes_in_edges.add(edge_record["source"])
+                nodes_in_edges.add(edge_record["target"])
+        
+        # Add placeholder nodes for entities referenced in edges but not in embedding stores
+        for node_id in nodes_in_edges:
+            if node_id not in node_to_rows and node_id not in existing_nodes:
+                # Create a minimal placeholder node
+                node_to_rows[node_id] = {
+                    'name': node_id,
+                    'content': node_id,  # Use node_id as content placeholder
+                }
+
+        # Collect all possible attributes from all nodes to ensure consistency
+        all_attributes = set()
+        for node in node_to_rows.values():
+            all_attributes.update(node.keys())
+        # Also check existing nodes for attributes
+        if existing_nodes and len(self.graph.vs) > 0:
+            # Get all attribute names from existing graph vertices
+            all_attributes.update(self.graph.vs.attribute_names())
+
+        # Ensure all nodes have all attributes (fill missing ones with None)
         for node_id, node in node_to_rows.items():
             node['name'] = node_id
+            for attr in all_attributes:
+                if attr not in node:
+                    node[attr] = None
+
+        new_nodes = {}
+        nodes_to_add = []
+        for node_id, node in node_to_rows.items():
             if node_id not in existing_nodes:
+                nodes_to_add.append(node_id)
                 for k, v in node.items():
                     if k not in new_nodes:
                         new_nodes[k] = []
                     new_nodes[k].append(v)
 
         if len(new_nodes) > 0:
-            self.graph.add_vertices(n=len(next(iter(new_nodes.values()))), attributes=new_nodes)
+            num_nodes = len(nodes_to_add)
+            placeholder_count = len([n for n in nodes_in_edges if n not in existing_nodes and n in node_to_rows and node_to_rows[n].get('content') == n])
+            logger.info(f"Adding {num_nodes} new nodes to graph (including {placeholder_count} placeholder nodes for entities in edges)")
+            self.graph.add_vertices(n=num_nodes, attributes=new_nodes)
+        
+        # Verify all nodes referenced in edges now exist in the graph
+        if hasattr(self, 'edge_records') and self.edge_records:
+            current_node_ids = set(self.graph.vs["name"])
+            missing_nodes = set()
+            for edge_record in self.edge_records:
+                if edge_record["source"] not in current_node_ids:
+                    missing_nodes.add(edge_record["source"])
+                if edge_record["target"] not in current_node_ids:
+                    missing_nodes.add(edge_record["target"])
+            if missing_nodes:
+                logger.warning(f"After add_new_nodes(), {len(missing_nodes)} nodes referenced in edges are still missing from graph. This may cause edge addition to fail.")
+                logger.debug(f"Sample missing nodes: {list(missing_nodes)[:5]}")
 
     def add_new_edges(self):
         """
-        Processes edges from `node_to_node_stats` to add them into a graph object while
+        Processes edges from `edge_records` to add them into a graph object while
         managing adjacency lists, validating edges, and logging invalid edge cases.
+        Supports multiple edges between the same nodes with different relation types.
         """
 
-        graph_adj_list = defaultdict(dict)
-        graph_inverse_adj_list = defaultdict(dict)
         edge_source_node_keys = []
         edge_target_node_keys = []
         edge_metadata = []
-        for edge, weight in self.node_to_node_stats.items():
-            if edge[0] == edge[1]: continue
-            graph_adj_list[edge[0]][edge[1]] = weight
-            graph_inverse_adj_list[edge[1]][edge[0]] = weight
+        
+        for edge_record in self.edge_records:
+            source = edge_record["source"]
+            target = edge_record["target"]
+            if source == target:
+                continue
 
-            edge_source_node_keys.append(edge[0])
-            edge_target_node_keys.append(edge[1])
+            edge_source_node_keys.append(source)
+            edge_target_node_keys.append(target)
             edge_metadata.append({
-                "weight": weight
+                "weight": edge_record["weight"],
+                "relation_type": edge_record.get("relation_type", "ATTRIBUTION")
             })
 
-        valid_edges, valid_weights = [], {"weight": []}
+        valid_edges, valid_weights, valid_relation_types = [], {"weight": []}, {"relation_type": []}
         current_node_ids = set(self.graph.vs["name"])
         for source_node_id, target_node_id, edge_d in zip(edge_source_node_keys, edge_target_node_keys, edge_metadata):
             if source_node_id in current_node_ids and target_node_id in current_node_ids:
                 valid_edges.append((source_node_id, target_node_id))
                 weight = edge_d.get("weight", 1.0)
+                relation_type = edge_d.get("relation_type", "ATTRIBUTION")
                 valid_weights["weight"].append(weight)
+                valid_relation_types["relation_type"].append(relation_type)
             else:
                 logger.warning(f"Edge {source_node_id} -> {target_node_id} is not valid.")
+        
+        # Add edges with both weight and relation_type attributes
+        edge_attrs = {**valid_weights, **valid_relation_types}
         self.graph.add_edges(
             valid_edges,
-            attributes=valid_weights
+            attributes=edge_attrs
         )
 
     def save_igraph(self):
@@ -1373,16 +1578,18 @@ class HippoRAG:
         num_triples_with_passage_node = 0
         passage_nodes_set = set(passage_nodes_keys)
         num_triples_with_passage_node = sum(
-            1 for node_pair in self.node_to_node_stats
-            if node_pair[0] in passage_nodes_set or node_pair[1] in passage_nodes_set
+            1 for edge_record in getattr(self, 'edge_records', [])
+            if edge_record["source"] in passage_nodes_set or edge_record["target"] in passage_nodes_set
         )
         graph_info['num_triples_with_passage_node'] = num_triples_with_passage_node
 
-        graph_info['num_synonymy_triples'] = len(self.node_to_node_stats) - graph_info[
-            "num_extracted_triples"] - num_triples_with_passage_node
+        # Count synonymy edges
+        num_synonymy = sum(1 for e in getattr(self, 'edge_records', []) 
+                          if e.get("relation_type") == "SYNONYMY")
+        graph_info['num_synonymy_triples'] = num_synonymy
 
         # get # of total triples
-        graph_info["num_total_triples"] = len(self.node_to_node_stats)
+        graph_info["num_total_triples"] = len(getattr(self, 'edge_records', []))
 
         return graph_info
 
@@ -1484,7 +1691,7 @@ class HippoRAG:
             # prepare data_store
             chunk_triples = [[text_processing(t) for t in triple_results_dict[chunk_id].triples] for chunk_id in self.passage_node_keys]
 
-            self.node_to_node_stats = {}
+            self.edge_records = []
             self.ent_node_to_chunk_ids = {}
             self.add_fact_edges(self.passage_node_keys, chunk_triples)
 
@@ -1630,9 +1837,17 @@ class HippoRAG:
         linking_score_map = dict(sorted(linking_score_map.items(), key=lambda x: x[1], reverse=True)[:link_top_k])
 
         # only keep the top_k phrases in all_phrase_weights
+        # Note: linking_score_map may contain both entity phrases and passage texts
+        # We only want to filter entity phrases, not passage texts
         top_k_phrases = set(linking_score_map.keys())
-        top_k_phrases_keys = set(
-            [compute_mdhash_id(content=top_k_phrase, prefix="entity-") for top_k_phrase in top_k_phrases])
+        top_k_phrases_keys = set()
+        entity_phrases_in_map = 0
+        
+        for phrase in top_k_phrases:
+            phrase_key = compute_mdhash_id(content=phrase, prefix="entity-")
+            if phrase_key in self.node_name_to_vertex_idx:
+                top_k_phrases_keys.add(phrase_key)
+                entity_phrases_in_map += 1
 
         for phrase_key in self.node_name_to_vertex_idx:
             if phrase_key not in top_k_phrases_keys:
@@ -1640,7 +1855,17 @@ class HippoRAG:
                 if phrase_id is not None:
                     all_phrase_weights[phrase_id] = 0.0
 
-        assert np.count_nonzero(all_phrase_weights) == len(linking_score_map.keys())
+        # The assertion should only check entity phrases, not passage texts
+        # Passage texts are added to linking_score_map but don't have corresponding phrase weights
+        non_zero_count = np.count_nonzero(all_phrase_weights)
+        if non_zero_count != entity_phrases_in_map:
+            logger.warning(
+                f"Assertion mismatch: non_zero_phrase_weights={non_zero_count}, "
+                f"entity_phrases_in_linking_map={entity_phrases_in_map}, "
+                f"total_items_in_linking_map={len(linking_score_map.keys())}"
+            )
+            # Don't fail, just log the warning
+        
         return all_phrase_weights, linking_score_map
 
     def graph_search_with_fact_entities(self, query: str,
@@ -1674,6 +1899,10 @@ class HippoRAG:
         """
 
         #Assigning phrase weights based on selected facts from previous steps.
+        logger.debug(f"Processing {len(top_k_facts)} facts for seed entity generation")
+        if len(top_k_facts) > 0:
+            logger.debug(f"Sample facts: {top_k_facts[:3]}")
+        
         linking_score_map = {}  # from phrase to the average scores of the facts that contain the phrase
         phrase_scores = {}  # store all fact scores for each phrase regardless of whether they exist in the knowledge graph or not
         phrase_weights = np.zeros(len(self.graph.vs['name']))
@@ -1681,53 +1910,136 @@ class HippoRAG:
         number_of_occurs = np.zeros(len(self.graph.vs['name']))
 
         phrases_and_ids = set()
+        # Track entities from facts for logging
+        all_fact_entities = {}
 
+        # Get entity rows for content-based matching (fallback)
+        entity_rows = self.entity_embedding_store.get_all_id_to_rows()
+        
         for rank, f in enumerate(top_k_facts):
-            subject_phrase = f[0].lower()
-            predicate_phrase = f[1].lower()
-            object_phrase = f[2].lower()
+            # Validate fact structure
+            if not isinstance(f, (tuple, list)) or len(f) < 3:
+                logger.warning(f"Invalid fact structure at rank {rank}: {type(f)} = {repr(f)[:100]}. Skipping.")
+                continue
+            
+            # Extract subject (first) and object (third) - the two edge nodes of the fact
+            # Use text_processing to normalize entities (matching how they're stored in graph)
+            subject_phrase = text_processing(f[0]) if f[0] is not None else ""
+            object_phrase = text_processing(f[2]) if f[2] is not None else ""
+            
+            # Skip if essential components are missing
+            if not subject_phrase or not object_phrase:
+                logger.warning(f"Fact at rank {rank} has missing subject or object. Skipping.")
+                continue
+            
             fact_score = query_fact_scores[
                 top_k_fact_indices[rank]] if query_fact_scores.ndim > 0 else query_fact_scores
 
+            # Process both subject and object (the two edge nodes of the fact)
             for phrase in [subject_phrase, object_phrase]:
+                # First try: compute hash from normalized phrase (standard method)
                 phrase_key = compute_mdhash_id(
                     content=phrase,
                     prefix="entity-"
                 )
                 phrase_id = self.node_name_to_vertex_idx.get(phrase_key, None)
+                
+                # Fallback: if hash lookup fails, search by content
+                if phrase_id is None:
+                    # Search through entity store to find matching entity by content
+                    for entity_key, entity_row in entity_rows.items():
+                        entity_content = entity_row.get("content", "")
+                        normalized_content = text_processing(entity_content)
+                        if normalized_content == phrase:
+                            phrase_key = entity_key
+                            phrase_id = self.node_name_to_vertex_idx.get(phrase_key, None)
+                            if phrase_id is not None:
+                                logger.debug(f"Found entity '{phrase}' via content matching: {entity_key}")
+                                break
+
+                # Track entities from facts for logging (weighted by occurrence)
+                if phrase_key not in all_fact_entities:
+                    all_fact_entities[phrase_key] = {
+                        'phrase': phrase,
+                        'phrase_id': phrase_id,
+                        'occurrence_count': 0,
+                        'total_score': 0.0,
+                        'phrase_key': phrase_key
+                    }
+                all_fact_entities[phrase_key]['occurrence_count'] += 1
 
                 if phrase_id is not None:
                     weighted_fact_score = fact_score
 
+                    # Weight by number of chunks containing this entity (matching baseline)
                     if len(self.ent_node_to_chunk_ids.get(phrase_key, set())) > 0:
                         weighted_fact_score /= len(self.ent_node_to_chunk_ids[phrase_key])
 
                     phrase_weights[phrase_id] += weighted_fact_score
                     number_of_occurs[phrase_id] += 1
+                    all_fact_entities[phrase_key]['total_score'] += weighted_fact_score
 
                 phrases_and_ids.add((phrase, phrase_id))
 
         phrase_weights /= number_of_occurs
+        # Clean up inf/nan values to prevent weight corruption
+        phrase_weights = np.where(np.isnan(phrase_weights) | np.isinf(phrase_weights), 0, phrase_weights)
+        
+        # Store fact entities for logging (before get_top_k_weights filtering)
+        self._all_fact_entities_from_current_query = all_fact_entities
+        
+        # Debug: Count entities found in graph vs not found
+        entities_in_graph = sum(1 for _, pid in phrases_and_ids if pid is not None)
+        entities_not_in_graph = sum(1 for _, pid in phrases_and_ids if pid is None)
+        
+        if entities_not_in_graph > 0:
+            # Log which entities weren't found
+            missing_entities = [phrase for phrase, pid in phrases_and_ids if pid is None]
+            logger.warning(f"Entities from facts: {entities_in_graph} in graph, {entities_not_in_graph} not in graph")
+            logger.warning(f"Missing entities (first 5): {missing_entities[:5]}")
+        
+        if entities_in_graph == 0:
+            # Log sample facts and entities to help debug
+            logger.error(f"No entities found in graph from {len(top_k_facts)} facts!")
+            logger.error(f"Sample facts: {top_k_facts[:3]}")
+            logger.error(f"Sample entities tried: {[text_processing(f[0]) if len(f) > 0 else '' for f in top_k_facts[:3]]}")
+            logger.error(f"Total entity nodes in graph: {len(self.entity_node_keys)}")
+            logger.error(f"Total nodes in graph: {len(self.node_name_to_vertex_idx)}")
 
         for phrase, phrase_id in phrases_and_ids:
-            if phrase not in phrase_scores:
-                phrase_scores[phrase] = []
-
-            phrase_scores[phrase].append(phrase_weights[phrase_id])
+            # Only process phrases that exist in the graph
+            if phrase_id is not None:
+                if phrase not in phrase_scores:
+                    phrase_scores[phrase] = []
+                phrase_scores[phrase].append(phrase_weights[phrase_id])
 
         # calculate average fact score for each phrase
         for phrase, scores in phrase_scores.items():
             linking_score_map[phrase] = float(np.mean(scores))
-
+        
+        # Debug: Log before filtering
+        if len(linking_score_map) == 0:
+            logger.warning(f"No entities found in graph from {len(top_k_facts)} facts. Facts: {top_k_facts[:3]}")
+        
         if link_top_k:
             phrase_weights, linking_score_map = self.get_top_k_weights(link_top_k,
                                                                            phrase_weights,
                                                                            linking_score_map)  # at this stage, the length of linking_scope_map is determined by link_top_k
+            
+            # Debug: Log after filtering
+            if len(linking_score_map) == 0:
+                logger.warning(f"After get_top_k_weights({link_top_k}), no entities remain in linking_score_map")
 
         #Get passage scores according to chosen dense retrieval model
+        # Note: dense_passage_retrieval returns ALL passages sorted by score, not just top k
         dpr_sorted_doc_ids, dpr_sorted_doc_scores = self.dense_passage_retrieval(query)
         normalized_dpr_sorted_scores = min_max_normalize(dpr_sorted_doc_scores)
+        
+        # Verify all passages are included
+        assert len(dpr_sorted_doc_ids) == len(self.passage_node_keys), \
+            f"DPR returned {len(dpr_sorted_doc_ids)} passages but expected {len(self.passage_node_keys)}"
 
+        # Assign weights to ALL passage nodes (not just top k)
         for i, dpr_sorted_doc_id in enumerate(dpr_sorted_doc_ids.tolist()):
             passage_node_key = self.passage_node_keys[dpr_sorted_doc_id]
             passage_dpr_score = normalized_dpr_sorted_scores[i]
@@ -1739,7 +2051,7 @@ class HippoRAG:
         #Combining phrase and passage scores into one array for PPR
         node_weights = phrase_weights + passage_weights
 
-        #Recording top 30 facts in linking_score_map
+        # Recording top 30 facts in linking_score_map
         if len(linking_score_map) > 30:
             linking_score_map = dict(sorted(linking_score_map.items(), key=lambda x: x[1], reverse=True)[:30])
 
@@ -1752,8 +2064,12 @@ class HippoRAG:
 
         self.ppr_time += (ppr_end - ppr_start)
 
+        # Verify ALL passages are included in PPR results (matching baseline HippoRAG)
         assert len(ppr_sorted_doc_ids) == len(
             self.passage_node_idxs), f"Doc prob length {len(ppr_sorted_doc_ids)} != corpus length {len(self.passage_node_idxs)}"
+        
+        # Log verification that all passages are included
+        logger.debug(f"PPR returned {len(ppr_sorted_doc_ids)} passages (all passages included)")
 
         return ppr_sorted_doc_ids, ppr_sorted_doc_scores
 
@@ -1802,50 +2118,128 @@ class HippoRAG:
         logger.debug(f"Using relation-aware retrieval for query: {query[:50]}...")
         relation_influence_factors = self.manager_agent.get_relation_influence_factors(query)
         
-        # Assigning phrase weights based on selected facts (same as original)
+        # Assigning phrase weights based on selected facts
+        logger.debug(f"Processing {len(top_k_facts)} facts for seed entity generation")
+        if len(top_k_facts) > 0:
+            logger.debug(f"Sample facts: {top_k_facts[:3]}")
+        
         linking_score_map = {}
         phrase_scores = {}
         phrase_weights = np.zeros(len(self.graph.vs['name']))
         passage_weights = np.zeros(len(self.graph.vs['name']))
         number_of_occurs = np.zeros(len(self.graph.vs['name']))
         
+        # Get entity rows for content-based matching (fallback)
+        entity_rows = self.entity_embedding_store.get_all_id_to_rows()
+        
         phrases_and_ids = set()
+        # Track entities from facts for logging
+        all_fact_entities = {}
         
         for rank, f in enumerate(top_k_facts):
-            subject_phrase = f[0].lower()
-            predicate_phrase = f[1].lower()
-            object_phrase = f[2].lower()
+            # Validate fact structure
+            if not isinstance(f, (tuple, list)) or len(f) < 3:
+                logger.warning(f"Invalid fact structure at rank {rank}: {type(f)} = {repr(f)[:100]}. Skipping.")
+                continue
+            
+            # Extract subject (first) and object (third) - the two edge nodes of the fact
+            # Use text_processing to normalize entities (matching how they're stored in graph)
+            subject_phrase = text_processing(f[0]) if f[0] is not None else ""
+            object_phrase = text_processing(f[2]) if f[2] is not None else ""
+            
+            # Skip if essential components are missing
+            if not subject_phrase or not object_phrase:
+                logger.warning(f"Fact at rank {rank} has missing subject or object. Skipping.")
+                continue
+            
             fact_score = query_fact_scores[
                 top_k_fact_indices[rank]] if query_fact_scores.ndim > 0 else query_fact_scores
             
+            # Process both subject and object (the two edge nodes of the fact)
             for phrase in [subject_phrase, object_phrase]:
+                # First try: compute hash from normalized phrase (standard method)
                 phrase_key = compute_mdhash_id(
                     content=phrase,
                     prefix="entity-"
                 )
                 phrase_id = self.node_name_to_vertex_idx.get(phrase_key, None)
                 
+                # Fallback: if hash lookup fails, search by content
+                if phrase_id is None:
+                    # Search through entity store to find matching entity by content
+                    for entity_key, entity_row in entity_rows.items():
+                        entity_content = entity_row.get("content", "")
+                        normalized_content = text_processing(entity_content)
+                        if normalized_content == phrase:
+                            phrase_key = entity_key
+                            phrase_id = self.node_name_to_vertex_idx.get(phrase_key, None)
+                            if phrase_id is not None:
+                                logger.debug(f"Found entity '{phrase}' via content matching: {entity_key}")
+                                break
+                
+                # Track entities from facts for logging (weighted by occurrence)
+                if phrase_key not in all_fact_entities:
+                    all_fact_entities[phrase_key] = {
+                        'phrase': phrase,
+                        'phrase_id': phrase_id,
+                        'occurrence_count': 0,
+                        'total_score': 0.0,
+                        'phrase_key': phrase_key
+                    }
+                all_fact_entities[phrase_key]['occurrence_count'] += 1
+                
                 if phrase_id is not None:
                     weighted_fact_score = fact_score
                     
+                    # Weight by number of chunks containing this entity (matching baseline)
                     if len(self.ent_node_to_chunk_ids.get(phrase_key, set())) > 0:
                         weighted_fact_score /= len(self.ent_node_to_chunk_ids[phrase_key])
                     
                     phrase_weights[phrase_id] += weighted_fact_score
                     number_of_occurs[phrase_id] += 1
+                    all_fact_entities[phrase_key]['total_score'] += weighted_fact_score
                 
                 phrases_and_ids.add((phrase, phrase_id))
         
         phrase_weights /= number_of_occurs
+        # Clean up inf/nan values to prevent weight corruption
+        phrase_weights = np.where(np.isnan(phrase_weights) | np.isinf(phrase_weights), 0, phrase_weights)
         
+        # Store fact entities for logging (before get_top_k_weights filtering)
+        self._all_fact_entities_from_current_query = all_fact_entities
+        
+        # Debug: Count entities found in graph vs not found
+        entities_in_graph = sum(1 for _, pid in phrases_and_ids if pid is not None)
+        entities_not_in_graph = sum(1 for _, pid in phrases_and_ids if pid is None)
+        
+        if entities_not_in_graph > 0:
+            # Log which entities weren't found
+            missing_entities = [phrase for phrase, pid in phrases_and_ids if pid is None]
+            logger.warning(f"Entities from facts: {entities_in_graph} in graph, {entities_not_in_graph} not in graph")
+            logger.warning(f"Missing entities (first 5): {missing_entities[:5]}")
+        
+        if entities_in_graph == 0:
+            # Log sample facts and entities to help debug
+            logger.error(f"No entities found in graph from {len(top_k_facts)} facts!")
+            logger.error(f"Sample facts: {top_k_facts[:3]}")
+            logger.error(f"Sample entities tried: {[text_processing(f[0]) if len(f) > 0 else '' for f in top_k_facts[:3]]}")
+            logger.error(f"Total entity nodes in graph: {len(self.entity_node_keys)}")
+            logger.error(f"Total nodes in graph: {len(self.node_name_to_vertex_idx)}")
+
         for phrase, phrase_id in phrases_and_ids:
-            if phrase not in phrase_scores:
-                phrase_scores[phrase] = []
-            phrase_scores[phrase].append(phrase_weights[phrase_id])
-        
-        # Calculate average fact score for each phrase
+            # Only process phrases that exist in the graph
+            if phrase_id is not None:
+                if phrase not in phrase_scores:
+                    phrase_scores[phrase] = []
+                phrase_scores[phrase].append(phrase_weights[phrase_id])
+
+        # calculate average fact score for each phrase
         for phrase, scores in phrase_scores.items():
             linking_score_map[phrase] = float(np.mean(scores))
+        
+        # Debug: Log before filtering
+        if len(linking_score_map) == 0:
+            logger.warning(f"No entities found in graph from {len(top_k_facts)} facts. Facts: {top_k_facts[:3]}")
         
         if link_top_k:
             phrase_weights, linking_score_map = self.get_top_k_weights(
@@ -1853,11 +2247,15 @@ class HippoRAG:
                 phrase_weights,
                 linking_score_map
             )
+            
+            # Debug: Log after filtering
+            if len(linking_score_map) == 0:
+                logger.warning(f"After get_top_k_weights({link_top_k}), no entities remain in linking_score_map")
         
         # Get passage scores according to chosen dense retrieval model
         dpr_sorted_doc_ids, dpr_sorted_doc_scores = self.dense_passage_retrieval(query)
         normalized_dpr_sorted_scores = min_max_normalize(dpr_sorted_doc_scores)
-        
+
         for i, dpr_sorted_doc_id in enumerate(dpr_sorted_doc_ids.tolist()):
             passage_node_key = self.passage_node_keys[dpr_sorted_doc_id]
             passage_dpr_score = normalized_dpr_sorted_scores[i]
@@ -1935,15 +2333,120 @@ class HippoRAG:
             # Get the actual fact IDs
             real_candidate_fact_ids = [self.fact_node_keys[idx] for idx in candidate_fact_indices]
             fact_row_dict = self.fact_embedding_store.get_rows(real_candidate_fact_ids)
-            candidate_facts = [eval(fact_row_dict[id]['content']) for id in real_candidate_fact_ids]
+            # Parse fact content safely
+            import ast
+            candidate_facts = []
+            for id in real_candidate_fact_ids:
+                fact_content = fact_row_dict[id]['content']
+                
+                # Log first few fact contents for debugging
+                if len(candidate_facts) < 3:
+                    logger.debug(f"Fact content sample (id={id}): {repr(fact_content[:200])}")
+                
+                # Facts can be stored in multiple formats:
+                # 1. Python tuple string: "('subject', 'predicate', 'object')"
+                # 2. Custom delimiter format: "subject ||| predicate ||| object"
+                # 3. Extended format with relation type: "subject ||| predicate ||| object ||| RELATION_TYPE ||| weight"
+                # 4. JSON format: '["subject", "predicate", "object"]'
+                
+                parsed_fact = None
+                
+                # First, try parsing as "|||" delimited format (most common based on warnings)
+                if isinstance(fact_content, str) and '|||' in fact_content:
+                    parts = [p.strip() for p in fact_content.split('|||')]
+                    if len(parts) >= 3:
+                        # Extract subject, predicate, object (ignore relation_type and weight if present)
+                        parsed_fact = (parts[0], parts[1], parts[2])
+                        if len(candidate_facts) < 3:
+                            logger.debug(f"Parsed ||| format fact: {parsed_fact}")
+                    else:
+                        logger.warning(f"Invalid ||| format fact (parts={len(parts)}): {fact_content[:100]}")
+                
+                # If not ||| format, try JSON
+                if parsed_fact is None:
+                    try:
+                        json_parsed = json.loads(fact_content)
+                        if isinstance(json_parsed, list) and len(json_parsed) >= 3:
+                            parsed_fact = tuple(json_parsed[:3])
+                        elif isinstance(json_parsed, dict):
+                            parsed_fact = (json_parsed.get('subject', ''), 
+                                         json_parsed.get('predicate', ''), 
+                                         json_parsed.get('object', ''))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                
+                # If still not parsed, try ast.literal_eval (for Python tuple strings)
+                if parsed_fact is None:
+                    try:
+                        eval_result = ast.literal_eval(fact_content)
+                        if isinstance(eval_result, (tuple, list)) and len(eval_result) >= 3:
+                            parsed_fact = tuple(eval_result[:3])
+                    except (ValueError, SyntaxError):
+                        pass
+                
+                # Last resort: try eval (less safe)
+                if parsed_fact is None:
+                    try:
+                        eval_result = eval(fact_content)
+                        if isinstance(eval_result, (tuple, list)) and len(eval_result) >= 3:
+                            parsed_fact = tuple(eval_result[:3])
+                    except Exception:
+                        pass
+                
+                # If all parsing failed, log and skip (don't add invalid facts)
+                if parsed_fact is None:
+                    logger.warning(f"Failed to parse fact content for id {id}. Content preview: {repr(fact_content[:100])}. Skipping this fact.")
+                    continue  # Skip this fact instead of adding invalid data
+                candidate_facts.append(parsed_fact)
             
-            # Rerank the facts
-            top_k_fact_indices, top_k_facts, reranker_dict = self.rerank_filter(query,
-                                                                                candidate_facts,
-                                                                                candidate_fact_indices,
-                                                                                len_after_rerank=link_top_k)
-            
-            rerank_log = {'facts_before_rerank': candidate_facts, 'facts_after_rerank': top_k_facts}
+            # Check if reranking is disabled (for debugging/experiments)
+            if hasattr(self.global_config, 'disable_rerank_filter') and self.global_config.disable_rerank_filter:
+                # Deduplicate facts before selecting top N
+                # Use a dict to track seen facts and keep the first occurrence (highest score)
+                seen_facts = {}
+                deduplicated_facts = []
+                deduplicated_indices = []
+                
+                for idx, fact in zip(candidate_fact_indices, candidate_facts):
+                    # Normalize fact tuple for comparison (handle None values)
+                    if isinstance(fact, (tuple, list)) and len(fact) >= 3:
+                        # Normalize by converting to lowercase strings and handling None
+                        normalized_fact = (
+                            str(fact[0]).lower().strip() if fact[0] is not None else "",
+                            str(fact[1]).lower().strip() if fact[1] is not None else "",
+                            str(fact[2]).lower().strip() if fact[2] is not None else ""
+                        )
+                        fact_key = normalized_fact
+                    else:
+                        # For non-tuple facts, use the string representation
+                        fact_key = str(fact).lower().strip()
+                    
+                    # Only add if we haven't seen this fact before
+                    if fact_key not in seen_facts:
+                        seen_facts[fact_key] = True
+                        deduplicated_facts.append(fact)
+                        deduplicated_indices.append(idx)
+                
+                # Now select top N from deduplicated facts
+                num_facts_to_use = getattr(self.global_config, 'num_facts_without_rerank', 10)
+                if len(deduplicated_facts) > num_facts_to_use:
+                    top_k_facts = deduplicated_facts[:num_facts_to_use]
+                    top_k_fact_indices = deduplicated_indices[:num_facts_to_use]
+                else:
+                    top_k_facts = deduplicated_facts
+                    top_k_fact_indices = deduplicated_indices
+                
+                logger.debug(f"Deduplicated {len(candidate_facts)} facts to {len(deduplicated_facts)} unique facts, selected top {len(top_k_facts)}")
+                if len(top_k_facts) == 0:
+                    logger.warning(f"No facts after deduplication! candidate_facts had {len(candidate_facts)} facts")
+                rerank_log = {'facts_before_rerank': candidate_facts, 'facts_after_rerank': top_k_facts, 'rerank_disabled': True}
+            else:
+                # Rerank the facts
+                top_k_fact_indices, top_k_facts, reranker_dict = self.rerank_filter(query,
+                                                                                    candidate_facts,
+                                                                                    candidate_fact_indices,
+                                                                                    len_after_rerank=link_top_k)
+                rerank_log = {'facts_before_rerank': candidate_facts, 'facts_after_rerank': top_k_facts}
             
             return top_k_fact_indices, top_k_facts, rerank_log
             

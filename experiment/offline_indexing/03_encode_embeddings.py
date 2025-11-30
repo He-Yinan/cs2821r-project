@@ -36,6 +36,43 @@ def triples_to_strings(triples: List[tuple[str, str, str]]) -> List[str]:
     return [f"{subj} ||| {pred} ||| {obj}" for subj, pred, obj in triples]
 
 
+def triples_to_strings_with_metadata(chunk_triples: List[List[dict]]) -> List[str]:
+    """
+    Convert triples to strings including relation_type and confidence.
+    Format: "subject ||| predicate ||| object ||| relation_type ||| confidence"
+    """
+    fact_strings = []
+    for triples in chunk_triples:
+        for t in triples:
+            if isinstance(t, dict):
+                subj = str(t.get("subject", "")).strip()
+                pred = str(t.get("predicate", "")).strip()
+                obj = str(t.get("object", "")).strip()
+                rel_type = str(t.get("relation_type", "ATTRIBUTION")).strip()
+                conf = t.get("confidence", 1.0)
+                try:
+                    conf = float(conf)
+                except (TypeError, ValueError):
+                    conf = 1.0
+                
+                if subj and obj:
+                    fact_strings.append(f"{subj} ||| {pred} ||| {obj} ||| {rel_type} ||| {conf:.3f}")
+            elif isinstance(t, (list, tuple)) and len(t) >= 3:
+                # Fallback for old format (no relation_type/confidence)
+                subj, pred, obj = str(t[0]), str(t[1]), str(t[2])
+                fact_strings.append(f"{subj} ||| {pred} ||| {obj} ||| ATTRIBUTION ||| 1.000")
+    
+    # Deduplicate while preserving order
+    seen = set()
+    unique_strings = []
+    for s in fact_strings:
+        if s not in seen:
+            seen.add(s)
+            unique_strings.append(s)
+    
+    return unique_strings
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Encode embeddings for chunks/entities/facts.")
     parser.add_argument("--experiment-name", required=True, help="Experiment folder name")
@@ -82,8 +119,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         entity for record in ner_records for entity in record.get("entities", [])
     )
     chunk_triples = [record.get("triples", []) for record in triples]
-    fact_tuples = flatten_facts(chunk_triples)
-    fact_texts = triples_to_strings(fact_tuples)
+    
+    # Option 1: Include relation_type and confidence in fact embeddings
+    # This makes fact embeddings richer and can help with relation-aware retrieval
+    fact_texts = triples_to_strings_with_metadata(chunk_triples)
+    
+    # Option 2: Original approach (only subject/predicate/object)
+    # Uncomment below and comment above to use original format
+    # fact_tuples = flatten_facts(chunk_triples)
+    # fact_texts = triples_to_strings(fact_tuples)
 
     llm_label = args.llm_model_name.replace("/", "_")
     embedding_label = args.embedding_model_name.replace("/", "_")

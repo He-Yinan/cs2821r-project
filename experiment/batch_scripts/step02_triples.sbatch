@@ -18,12 +18,14 @@ export HF_HOME="${CACHE_ROOT}/hf_home"
 export HUGGINGFACE_HUB_CACHE="${CACHE_ROOT}/hf_cache"
 
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-musique_demo}
-# LLM_BASE_URL=${LLM_BASE_URL:-http://holygpu7c26106.rc.fas.harvard.edu:8000/v1}
-LLM_BASE_URL=${LLM_BASE_URL:-http://holygpu7c26106.rc.fas.harvard.edu:8001/v1}
+LLM_BASE_URL=${LLM_BASE_URL:-http://holygpu7c26106.rc.fas.harvard.edu:8000/v1}
+# LLM_BASE_URL=${LLM_BASE_URL:-http://holygpu7c26106.rc.fas.harvard.edu:8001/v1}
 LLM_MODEL_NAME=${LLM_MODEL_NAME:-Qwen/Qwen3-8B}
 MAX_WORKERS=${MAX_WORKERS:-8}
 MAX_CHUNKS=${MAX_CHUNKS:-}  # Set to a number (e.g., 5) for testing, leave empty for full run
 TEST_OUTPUT=${TEST_OUTPUT:-false}  # Set to "true" to save to triples_test.jsonl
+INPUT_SUBDIR=${INPUT_SUBDIR:-offline_indexing/01_chunk_ner_50}
+OUTPUT_SUBDIR=${OUTPUT_SUBDIR:-offline_indexing/02_triples_50}
 
 export BASHRCSOURCED=1
 source ~/.bashrc
@@ -35,6 +37,8 @@ CMD_ARGS=(
   --llm-base-url "${LLM_BASE_URL}"
   --llm-model-name "${LLM_MODEL_NAME}"
   --max-workers "${MAX_WORKERS}"
+  --input-subdir "${INPUT_SUBDIR}"
+  --output-subdir "${OUTPUT_SUBDIR}"
 )
 
 if [ -n "${MAX_CHUNKS}" ]; then
