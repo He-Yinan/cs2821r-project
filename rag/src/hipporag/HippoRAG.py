@@ -703,7 +703,7 @@ class HippoRAG:
         else:
             return queries_solutions, all_response_message, all_metadata
 
-        def qa(self, queries: List[QuerySolution]) -> Tuple[List[QuerySolution], List[str], List[Dict]]:
+    def qa(self, queries: List[QuerySolution]) -> Tuple[List[QuerySolution], List[str], List[Dict]]:
         """
         Executes question-answering (QA) inference using a provided set of query solutions and a language model.
 
