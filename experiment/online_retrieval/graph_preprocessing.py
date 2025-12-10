@@ -182,7 +182,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--llm-model-name",
-        default="Qwen/Qwen3-8B-Instruct",
+        default="Qwen/Qwen3-8B",
         help="LLM model name (for config)"
     )
     parser.add_argument(
@@ -192,8 +192,13 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--llm-base-url",
-        default="http://localhost:8000/v1",
+        default="http://holygpu7c26105.rc.fas.harvard.edu:8000/v1",
         help="OpenAI-compatible LLM endpoint"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force regeneration of matrices even if they already exist"
     )
 
     return parser.parse_args(argv)
@@ -203,9 +208,21 @@ def main(argv: List[str] | None = None) -> None:
     args = parse_args(argv)
 
     # Setup paths
-    experiment_dir = PROJECT_ROOT / "experiment" / "dataset" / args.experiment_name
+    # Results directory is on scratch
+    results_base = Path("/n/netscratch/tambe_lab/Lab/msong300/cs2821r-results/experiments")
+    experiment_dir = results_base / args.experiment_name
     workspace_dir = experiment_dir / args.workspace_subdir
     output_dir = experiment_dir / args.output_subdir
+
+    # Check if matrices already exist
+    if not args.force and output_dir.exists():
+        matrix_files = list(output_dir.glob("matrix_*.npz"))
+        metadata_file = output_dir / "graph_metadata.pkl"
+        if len(matrix_files) > 0 and metadata_file.exists():
+            print(f"Relation matrices already exist in {output_dir}")
+            print(f"Found {len(matrix_files)} matrix files and metadata file")
+            print("Skipping graph preprocessing. Use --force to regenerate.")
+            return
 
     if not workspace_dir.exists():
         raise FileNotFoundError(
@@ -214,6 +231,58 @@ def main(argv: List[str] | None = None) -> None:
         )
 
     print(f"Loading HippoRAG graph from {workspace_dir}...")
+
+    # Find the actual working directory (it may have a different LLM model name)
+    # HippoRAG creates subdirectories like: {llm_label}_{embedding_label}
+    # where labels are model names with "/" replaced by "_"
+    llm_label = args.llm_model_name.replace("/", "_")
+    embedding_label = args.embedding_model_name.replace("/", "_")
+    expected_working_dir = workspace_dir / f"{llm_label}_{embedding_label}"
+    
+    # If expected directory doesn't exist, search for existing directories
+    actual_working_dir = None
+    if expected_working_dir.exists():
+        # Check if graph files exist
+        if (expected_working_dir / "graph.pickle").exists() or (expected_working_dir / "graph_cleaned.pickle").exists():
+            actual_working_dir = expected_working_dir
+            print(f"Found graph in expected directory: {actual_working_dir}")
+    
+    if actual_working_dir is None:
+        print(f"Expected directory {expected_working_dir} not found or missing graph files, searching for existing graph directories...")
+        # Look for directories with graph.pickle or graph_cleaned.pickle
+        matching_dirs = []
+        for item in workspace_dir.iterdir():
+            if item.is_dir():
+                graph_files = list(item.glob("graph*.pickle"))
+                if graph_files:
+                    matching_dirs.append(item)
+        
+        if matching_dirs:
+            if len(matching_dirs) == 1:
+                actual_working_dir = matching_dirs[0]
+                print(f"Found graph directory: {actual_working_dir}")
+                # Extract LLM name from directory (remove embedding part)
+                dir_name = actual_working_dir.name
+                if f"_{embedding_label}" in dir_name:
+                    llm_part = dir_name.replace(f"_{embedding_label}", "")
+                    # Update LLM model name to match the directory
+                    args.llm_model_name = llm_part.replace("_", "/")
+                    print(f"Using LLM model name: {args.llm_model_name} (extracted from directory name)")
+            else:
+                print(f"Found multiple matching directories: {[d.name for d in matching_dirs]}")
+                # Use the first one
+                actual_working_dir = matching_dirs[0]
+                print(f"Using: {actual_working_dir}")
+                dir_name = actual_working_dir.name
+                if f"_{embedding_label}" in dir_name:
+                    llm_part = dir_name.replace(f"_{embedding_label}", "")
+                    args.llm_model_name = llm_part.replace("_", "/")
+        else:
+            raise FileNotFoundError(
+                f"Could not find graph directory in {workspace_dir}. "
+                f"Expected: {expected_working_dir}, but it doesn't exist or is missing graph files. "
+                f"Please check that the graph has been built."
+            )
 
     # Load HippoRAG with existing graph
     config = BaseConfig(
@@ -224,6 +293,25 @@ def main(argv: List[str] | None = None) -> None:
     )
 
     hipporag = HippoRAG(global_config=config)
+    
+    # Verify the graph file exists and use graph_cleaned.pickle if graph.pickle doesn't exist
+    graph_pickle_path = Path(hipporag.working_dir) / "graph.pickle"
+    graph_cleaned_path = Path(hipporag.working_dir) / "graph_cleaned.pickle"
+    
+    if not graph_pickle_path.exists():
+        if graph_cleaned_path.exists():
+            print(f"graph.pickle not found, using graph_cleaned.pickle: {graph_cleaned_path}")
+            # Copy graph_cleaned.pickle to graph.pickle so HippoRAG can find it
+            import shutil
+            shutil.copy2(graph_cleaned_path, graph_pickle_path)
+            print(f"Copied graph_cleaned.pickle to graph.pickle")
+        else:
+            raise FileNotFoundError(
+                f"Graph pickle file not found in {hipporag.working_dir}. "
+                f"Expected: {graph_pickle_path} or {graph_cleaned_path}"
+            )
+    else:
+        print(f"Found graph.pickle: {graph_pickle_path}")
 
     # Load the graph (this should load from the pickle file in workspace_dir)
     if not hasattr(hipporag, 'graph') or hipporag.graph is None:
@@ -236,6 +324,34 @@ def main(argv: List[str] | None = None) -> None:
         )
 
     print(f"Graph loaded: {len(hipporag.graph.vs)} nodes, {len(hipporag.graph.es)} edges")
+
+    # Prepare retrieval objects to initialize node mappings
+    # This creates node_name_to_vertex_idx, passage_node_keys, passage_node_idxs, etc.
+    if not hasattr(hipporag, 'node_name_to_vertex_idx') or hipporag.node_name_to_vertex_idx is None:
+        print("Preparing retrieval objects to initialize node mappings...")
+        hipporag.prepare_retrieval_objects()
+    
+    # Verify required attributes exist
+    if not hasattr(hipporag, 'node_name_to_vertex_idx'):
+        raise RuntimeError(
+            "Failed to initialize node_name_to_vertex_idx. "
+            "Please ensure prepare_retrieval_objects() completed successfully."
+        )
+    
+    if not hasattr(hipporag, 'passage_node_keys'):
+        raise RuntimeError(
+            "Failed to initialize passage_node_keys. "
+            "Please ensure prepare_retrieval_objects() completed successfully."
+        )
+    
+    if not hasattr(hipporag, 'passage_node_idxs'):
+        raise RuntimeError(
+            "Failed to initialize passage_node_idxs. "
+            "Please ensure prepare_retrieval_objects() completed successfully."
+        )
+    
+    print(f"Node mappings initialized: {len(hipporag.node_name_to_vertex_idx)} nodes, "
+          f"{len(hipporag.passage_node_keys)} passage nodes")
 
     # Build relation-type specific matrices
     matrices = build_relation_matrices(hipporag, output_dir)

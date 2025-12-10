@@ -26,8 +26,17 @@ from .evaluation.qa_eval import QAExactMatch, QAF1Score
 from .prompts.linking import get_query_instruction
 from .prompts.prompt_template_manager import PromptTemplateManager
 from .rerank import DSPyFilter
-from .agents.manager_agent import ManagerAgent
-from .retrieval.relation_aware_ppr import run_relation_aware_ppr
+
+# Optional imports for relation-aware retrieval
+try:
+    from .agents.manager_agent import ManagerAgent
+except ImportError:
+    ManagerAgent = None
+
+try:
+    from .retrieval.relation_aware_ppr import run_relation_aware_ppr
+except ImportError:
+    run_relation_aware_ppr = None
 from .utils.misc_utils import *
 from .utils.misc_utils import NerRawOutput, TripleRawOutput, _normalize_relation_type
 from .utils.embed_utils import retrieve_knn
@@ -118,6 +127,31 @@ class HippoRAG:
         embedding_label = self.global_config.embedding_model_name.replace("/", "_")
         self.working_dir = os.path.join(self.global_config.save_dir, f"{llm_label}_{embedding_label}")
 
+        # Check if embeddings exist in this directory, if not, look for them in other directories with same embedding model
+        chunk_emb_dir = os.path.join(self.working_dir, "chunk_embeddings")
+        if not os.path.exists(chunk_emb_dir) or not os.listdir(chunk_emb_dir):
+            # Look for existing embeddings in other LLM directories with same embedding model
+            if os.path.exists(self.global_config.save_dir):
+                for item in os.listdir(self.global_config.save_dir):
+                    if item.endswith(f"_{embedding_label}") and item != f"{llm_label}_{embedding_label}":
+                        alt_dir = os.path.join(self.global_config.save_dir, item)
+                        alt_chunk_emb_dir = os.path.join(alt_dir, "chunk_embeddings")
+                        if os.path.exists(alt_chunk_emb_dir) and os.listdir(alt_chunk_emb_dir):
+                            logger.info(f"Found existing embeddings in {alt_dir}, will use them")
+                            # Create symlinks to reuse embeddings
+                            if not os.path.exists(self.working_dir):
+                                os.makedirs(self.working_dir, exist_ok=True)
+                            if not os.path.exists(chunk_emb_dir):
+                                os.makedirs(chunk_emb_dir, exist_ok=True)
+                            # Create symlinks for embedding stores
+                            for emb_type in ["chunk_embeddings", "entity_embeddings", "fact_embeddings"]:
+                                src = os.path.join(alt_dir, emb_type)
+                                dst = os.path.join(self.working_dir, emb_type)
+                                if os.path.exists(src) and not os.path.exists(dst):
+                                    os.symlink(src, dst)
+                                    logger.info(f"Created symlink: {dst} -> {src}")
+                            break
+
         if not os.path.exists(self.working_dir):
             logger.info(f"Creating working directory: {self.working_dir}")
             os.makedirs(self.working_dir, exist_ok=True)
@@ -156,7 +190,7 @@ class HippoRAG:
         self.rerank_filter = DSPyFilter(self)
 
         # Initialize Manager Agent for relation-aware retrieval
-        if self.global_config.use_relation_aware_retrieval:
+        if self.global_config.use_relation_aware_retrieval and ManagerAgent is not None:
             self.manager_agent = ManagerAgent(
                 llm=self.llm_model,
                 prompt_template_manager=self.prompt_template_manager
@@ -164,6 +198,8 @@ class HippoRAG:
             logger.info("Manager Agent initialized for relation-aware retrieval")
         else:
             self.manager_agent = None
+            if self.global_config.use_relation_aware_retrieval and ManagerAgent is None:
+                logger.warning("ManagerAgent not available, relation-aware retrieval disabled")
 
         self.ready_to_retrieve = False
 
@@ -455,10 +491,10 @@ class HippoRAG:
                 sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
             else:
                 sorted_doc_ids, sorted_doc_scores = self.graph_search_with_fact_entities(query=query,
-                                                                                         link_top_k=self.global_config.linking_top_k,
-                                                                                         query_fact_scores=query_fact_scores,
-                                                                                         top_k_facts=top_k_facts,
-                                                                                         top_k_fact_indices=top_k_fact_indices,
+                        link_top_k=self.global_config.linking_top_k,
+                        query_fact_scores=query_fact_scores,
+                        top_k_facts=top_k_facts,
+                        top_k_fact_indices=top_k_fact_indices,
                                                                                          passage_node_weight=self.global_config.passage_node_weight)
 
             top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]]
@@ -1540,6 +1576,17 @@ class HippoRAG:
         self.passage_embeddings = np.array(self.chunk_embedding_store.get_embeddings(self.passage_node_keys))
 
         self.fact_embeddings = np.array(self.fact_embedding_store.get_embeddings(self.fact_node_keys))
+        
+        # Validate that embeddings are loaded correctly
+        if len(self.passage_node_keys) == 0:
+            logger.error("No passage node keys found in embedding store. The workspace may not have been indexed properly.")
+            raise ValueError("No passage embeddings found. Please ensure the workspace has been indexed with documents.")
+        
+        if self.passage_embeddings.shape[0] == 0:
+            logger.error(f"Passage embeddings are empty. Expected {len(self.passage_node_keys)} embeddings, got 0.")
+            raise ValueError("Passage embeddings are empty. Please regenerate embeddings or re-index the workspace.")
+        
+        logger.info(f"Loaded {len(self.passage_node_keys)} passage embeddings with shape {self.passage_embeddings.shape}")
 
         all_openie_info, chunk_keys_to_process = self.load_existing_openie([])
 
@@ -1685,6 +1732,14 @@ class HippoRAG:
             - A numpy array of the normalized similarity scores for the corresponding
               documents.
         """
+        # Validate that passage embeddings exist
+        if self.passage_embeddings.shape[0] == 0:
+            logger.error("Cannot perform dense passage retrieval: passage embeddings are empty.")
+            logger.error("This usually means the workspace was not properly indexed.")
+            logger.error(f"Workspace directory: {self.working_dir}")
+            logger.error(f"Passage node keys count: {len(self.passage_node_keys)}")
+            raise ValueError("Passage embeddings are empty. Please ensure the workspace has been indexed with documents.")
+        
         query_embedding = self.query_to_embedding['passage'].get(query, None)
         if query_embedding is None:
             query_embedding = self.embedding_model.batch_encode(query,
@@ -1869,7 +1924,7 @@ class HippoRAG:
             self.passage_node_idxs), f"Doc prob length {len(ppr_sorted_doc_ids)} != corpus length {len(self.passage_node_idxs)}"
 
         return ppr_sorted_doc_ids, ppr_sorted_doc_scores
-        
+
 
     def rerank_facts(self, query: str, query_fact_scores: np.ndarray) -> Tuple[List[int], List[Tuple], dict]:
         """
@@ -1885,8 +1940,9 @@ class HippoRAG:
 
 
         """
-        # load args
-        link_top_k: int = self.global_config.linking_top_k
+        # TEMPORARY: Skip reranking and just use top 10 facts directly
+        # This bypasses the rerank_filter which seems to be filtering out all facts
+        num_facts_to_use = 10
         
         # Check if there are any facts to rerank
         if len(query_fact_scores) == 0 or len(self.fact_node_keys) == 0:
@@ -1894,28 +1950,70 @@ class HippoRAG:
             return [], [], {'facts_before_rerank': [], 'facts_after_rerank': []}
             
         try:
-            # Get the top k facts by score
-            if len(query_fact_scores) <= link_top_k:
+            # Get the top 10 facts by score (skip reranking)
+            if len(query_fact_scores) <= num_facts_to_use:
                 # If we have fewer facts than requested, use all of them
-                candidate_fact_indices = np.argsort(query_fact_scores)[::-1].tolist()
+                top_fact_indices = np.argsort(query_fact_scores)[::-1].tolist()
             else:
-                # Otherwise get the top k
-                candidate_fact_indices = np.argsort(query_fact_scores)[-link_top_k:][::-1].tolist()
+                # Otherwise get the top 10
+                top_fact_indices = np.argsort(query_fact_scores)[::-1][:num_facts_to_use].tolist()
                 
             # Get the actual fact IDs
-            real_candidate_fact_ids = [self.fact_node_keys[idx] for idx in candidate_fact_indices]
-            fact_row_dict = self.fact_embedding_store.get_rows(real_candidate_fact_ids)
-            candidate_facts = [eval(fact_row_dict[id]['content']) for id in real_candidate_fact_ids]
+            real_fact_ids = [self.fact_node_keys[idx] for idx in top_fact_indices]
+            fact_row_dict = self.fact_embedding_store.get_rows(real_fact_ids)
+            # Safely parse fact content (may be JSON string, Python literal, or ||| separated format)
+            import ast
+            import json
+            top_k_facts = []
+            for id in real_fact_ids:
+                content = fact_row_dict[id]['content']
+                fact = None
+                
+                # Try parsing different formats
+                # Format 1: JSON string (most common)
+                try:
+                    fact = json.loads(content)
+                except (json.JSONDecodeError, TypeError):
+                    # Format 2: Python literal (tuple/list format)
+                    try:
+                        fact = ast.literal_eval(content)
+                    except (ValueError, SyntaxError):
+                        # Format 3: ||| separated format
+                        if '|||' in content:
+                            parts = [p.strip() for p in content.split('|||')]
+                            if len(parts) >= 3:
+                                fact = (parts[0], parts[1], parts[2])
+                            elif len(parts) == 2:
+                                fact = (parts[0], parts[1], "")
+                            else:
+                                fact = None
+                        else:
+                            fact = None
+                
+                if fact is None:
+                    logger.warning(f"Could not parse fact content for {id}: {content[:100]}")
+                    continue
             
-            # Rerank the facts
-            top_k_fact_indices, top_k_facts, reranker_dict = self.rerank_filter(query,
-                                                                                candidate_facts,
-                                                                                candidate_fact_indices,
-                                                                                len_after_rerank=link_top_k)
+                # Ensure fact is in tuple format (subject, predicate, object)
+                if isinstance(fact, (list, tuple)) and len(fact) >= 3:
+                    top_k_facts.append((str(fact[0]), str(fact[1]), str(fact[2])))
+                elif isinstance(fact, dict):
+                    # Convert dict to tuple
+                    subj = str(fact.get('subject', fact.get(0, '')))
+                    pred = str(fact.get('predicate', fact.get(1, '')))
+                    obj = str(fact.get('object', fact.get(2, '')))
+                    top_k_facts.append((subj, pred, obj))
+                else:
+                    logger.warning(f"Unexpected fact format for {id}: {type(fact)}")
+                    continue
             
-            rerank_log = {'facts_before_rerank': candidate_facts, 'facts_after_rerank': top_k_facts}
+            # TEMPORARY: Skip reranking - return top 10 facts directly
+            # The rerank_filter was filtering out all facts, so we bypass it
+            logger.info(f"TEMPORARY: Skipping reranking, using top {len(top_k_facts)} facts directly")
             
-            return top_k_fact_indices, top_k_facts, rerank_log
+            rerank_log = {'facts_before_rerank': top_k_facts, 'facts_after_rerank': top_k_facts, 'reranking_disabled': True}
+            
+            return top_fact_indices, top_k_facts, rerank_log
             
         except Exception as e:
             logger.error(f"Error in rerank_facts: {str(e)}")

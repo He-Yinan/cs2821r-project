@@ -68,13 +68,36 @@ class DSPyFilter:
         for k, value in sections:
             if k == "fact_after_filter":
                 try:
-                    # fields[k] = parse_value(v, signature.output_fields[k].annotation) if _parse_values else v
+                    # Extract JSON from value - handle cases where LLM adds extra text after JSON
+                    # Find the first { and matching } to extract just the JSON object
+                    json_str = value.strip()
+                    
+                    # Try to find JSON object boundaries
+                    start_idx = json_str.find('{')
+                    if start_idx != -1:
+                        # Find matching closing brace
+                        brace_count = 0
+                        end_idx = start_idx
+                        for i in range(start_idx, len(json_str)):
+                            if json_str[i] == '{':
+                                brace_count += 1
+                            elif json_str[i] == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    end_idx = i + 1
+                                    break
+                        if brace_count == 0:
+                            json_str = json_str[start_idx:end_idx]
+                    
+                    # Try parsing as JSON first
                     try:
-                        parsed_value = json.loads(value)
+                        parsed_value = json.loads(json_str)
                     except json.JSONDecodeError:
+                        # If JSON parsing fails, try ast.literal_eval
                         try:
-                            parsed_value = ast.literal_eval(value)
+                            parsed_value = ast.literal_eval(json_str)
                         except (ValueError, SyntaxError):
+                            # If both fail, try the original value
                             parsed_value = value
                     parsed = TypeAdapter(Fact).validate_python(parsed_value).fact
                 except Exception as e:

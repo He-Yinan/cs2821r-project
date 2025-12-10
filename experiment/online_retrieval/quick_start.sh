@@ -17,7 +17,7 @@ set -e  # Exit on error
 EXPERIMENT_NAME="musique_demo"
 QUESTIONS_FILE="questions.jsonl"
 LLM_BASE_URL="http://localhost:8000/v1"
-LLM_MODEL="Qwen/Qwen3-8B-Instruct"
+LLM_MODEL="Qwen/Qwen3-8B"
 EMBEDDING_MODEL="facebook/contriever-msmarco"
 NUM_QUESTIONS=50  # Set to empty string to process all questions
 

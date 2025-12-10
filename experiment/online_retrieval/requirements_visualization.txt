@@ -1,0 +1,14 @@
+# Visualization dependencies for MARA-RAG animated PPR visualization
+# Install with: pip install -r requirements_visualization.txt
+
+# Core visualization libraries
+matplotlib>=3.5.0  # For plotting and animation
+networkx>=2.6.0   # For graph operations
+pillow>=8.0.0      # For GIF export (used by matplotlib animation writer)
+
+# Note: numpy, scipy, and igraph should already be installed as part of the main HippoRAG dependencies
+
+
+
+
+

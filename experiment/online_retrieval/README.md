@@ -180,7 +180,7 @@ Fields:
 - `--workspace-subdir`: HippoRAG workspace directory (default: `hipporag_workspace`)
 - `--matrix-subdir`: MARA matrices directory (default: `mara_matrices`)
 - `--output-subdir`: Output directory (default: `mara_results`)
-- `--llm-model-name`: LLM model name (default: `Qwen/Qwen3-8B-Instruct`)
+- `--llm-model-name`: LLM model name (default: `Qwen/Qwen3-8B`)
 - `--llm-base-url`: OpenAI-compatible LLM endpoint (default: `http://localhost:8000/v1`)
 - `--num-questions`: Number of questions to evaluate (default: all)
 - `--verbose`: Print debug information

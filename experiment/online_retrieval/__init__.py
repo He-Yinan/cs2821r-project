@@ -11,6 +11,13 @@ Components:
 - run_mara_experiment: End-to-end experiment runner
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to Python path for hipporag imports
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "rag" / "src"))
+
 __version__ = "1.0.0"
 __author__ = "CS2821R Project Team"
 

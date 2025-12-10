@@ -36,7 +36,7 @@ def cache_response(func):
 
         # get model, seed and temperature from kwargs or self.llm_config.generate_params
         gen_params = getattr(self, "llm_config", {}).generate_params if hasattr(self, "llm_config") else {}
-        model = kwargs.get("model", gen_params.get("model"))
+        model = kwargs.get("model", gen_params.get("model", "unknown"))
         seed = kwargs.get("seed", gen_params.get("seed"))
         temperature = kwargs.get("temperature", gen_params.get("temperature"))
 
@@ -72,10 +72,13 @@ def cache_response(func):
             if row is not None:
                 message, metadata_str = row
                 metadata = json.loads(metadata_str)
+                # Log cache hit
+                logger.info(f"⚠️  Cache HIT for model {model}: using cached response (hash {key_hash[:16]}...)")
                 # return cached result and mark as hit
                 return message, metadata, True
 
         # if cache miss, call the original function to get the result
+        logger.info(f"🔄 Cache MISS for model {model}: calling LLM API (hash {key_hash[:16]}...)")
         result = func(self, *args, **kwargs)
         message, metadata = result
 
@@ -162,7 +165,21 @@ class CacheOpenAI(BaseLLM):
         self.max_retries = kwargs.get("max_retries", 2)
 
         if self.global_config.azure_endpoint is None:
-            self.openai_client = OpenAI(base_url=self.llm_base_url, http_client=client, max_retries=self.max_retries, api_key="EMPTY")  # MINE
+            # Get API key from environment variable, or use None (OpenAI client will read from env)
+            api_key = os.getenv('OPENAI_API_KEY', None)
+            
+            # Check if we're using a custom base_url (non-OpenAI endpoint like vLLM)
+            # In this case, we can use a dummy API key since the endpoint doesn't validate it
+            is_custom_endpoint = self.llm_base_url and self.llm_base_url != "https://api.openai.com/v1"
+            
+            if api_key and api_key.strip() and api_key != "EMPTY":
+                self.openai_client = OpenAI(base_url=self.llm_base_url, http_client=client, max_retries=self.max_retries, api_key=api_key)
+            elif is_custom_endpoint:
+                # For custom endpoints (vLLM, etc.), use a dummy API key since they don't validate it
+                self.openai_client = OpenAI(base_url=self.llm_base_url, http_client=client, max_retries=self.max_retries, api_key="dummy-key")
+            else:
+                # For OpenAI's official endpoint, let client read from environment (default behavior)
+                self.openai_client = OpenAI(base_url=self.llm_base_url, http_client=client, max_retries=self.max_retries)
         else:
             self.openai_client = AzureOpenAI(api_version=self.global_config.azure_endpoint.split('api-version=')[1],
                                              azure_endpoint=self.global_config.azure_endpoint, max_retries=self.max_retries)
@@ -245,9 +262,32 @@ class CacheOpenAI(BaseLLM):
         params["messages"] = messages
         logger.debug(f"Calling OpenAI GPT API with:\n{params}")
 
-        if 'gpt' not in params['model'] or version.parse(openai.__version__) < version.parse("1.45.0"): # if we use vllm to call openai api or if we use openai but the version is too old to use 'max_completion_tokens' argument
-            # TODO strange version change in openai protocol, but our current vllm version not changed yet
-            params['max_tokens'] = params.pop('max_completion_tokens')
+        # Handle max_tokens vs max_completion_tokens conflict
+        # OpenAI API doesn't allow both to be set at the same time
+        is_gpt_model = 'gpt' in params.get('model', '').lower()
+        is_new_openai_version = version.parse(openai.__version__) >= version.parse("1.45.0")
+        
+        if is_gpt_model and is_new_openai_version:
+            # For GPT models with newer OpenAI API, use max_completion_tokens
+            # If max_tokens was passed in kwargs, convert it to max_completion_tokens
+            if 'max_tokens' in params:
+                max_tokens_value = params.pop('max_tokens')
+                # Only set max_completion_tokens if it's not already set
+                if 'max_completion_tokens' not in params:
+                    params['max_completion_tokens'] = max_tokens_value
+                    logger.debug(f"Converted 'max_tokens' ({max_tokens_value}) to 'max_completion_tokens' for GPT model")
+                else:
+                    logger.debug(f"Removed 'max_tokens' ({max_tokens_value}) in favor of existing 'max_completion_tokens' ({params['max_completion_tokens']})")
+        else:
+            # For non-GPT models or older OpenAI versions, use max_tokens
+            if 'max_completion_tokens' in params:
+                max_completion_value = params.pop('max_completion_tokens')
+                # Only set max_tokens if it's not already set
+                if 'max_tokens' not in params:
+                    params['max_tokens'] = max_completion_value
+                    logger.debug(f"Converted 'max_completion_tokens' ({max_completion_value}) to 'max_tokens' for non-GPT model")
+                else:
+                    logger.debug(f"Removed 'max_completion_tokens' ({max_completion_value}) in favor of existing 'max_tokens' ({params['max_tokens']})")
 
         response = self.openai_client.chat.completions.create(**params)
 
